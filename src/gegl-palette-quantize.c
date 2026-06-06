@@ -1,13 +1,18 @@
 /*
  * gegl-palette-quantize.c
  *
- * GEGL point filter: map every pixel to the nearest color from an inline
+ * GEGL filter: map every pixel to the nearest color from an inline
  * semicolon/comma/whitespace separated palette string, e.g.
  *   #000000;#ffffff;#ff0044
  *
- * Distance can be measured in sRGB, linear RGB, CIE Lab or OKLab. The output
- * is always the exact palette color (in sRGB), so it round-trips back to the
- * #RRGGBB the user picked; only the *matching* uses the chosen metric.
+ * Features:
+ *   - distance metric: sRGB / linear RGB / CIE Lab / OKLab
+ *   - dithering:       none / ordered (Bayer 8x8) / Floyd-Steinberg
+ *   - strength:        blend between original and quantized result
+ *
+ * Performance: nearest-color matching is served by a precomputed 3D lookup
+ * table (LUT_R^3 cells) built once in prepare(), so per-pixel work is O(1)
+ * instead of O(palette size). The LUT is built in the selected metric space.
  *
  * This operation is deliberately GIMP-independent. The companion GIMP plug-in
  * converts a selected GimpPalette into this inline string and appends/merges
@@ -30,6 +35,12 @@ enum_start (gegl_palette_quantize_metric)
   enum_value (GEGL_PQ_METRIC_OKLAB,  "oklab",   "OKLab (perceptual)")
 enum_end (GeglPaletteQuantizeMetric)
 
+enum_start (gegl_palette_quantize_dither)
+  enum_value (GEGL_PQ_DITHER_NONE,    "none",            "None")
+  enum_value (GEGL_PQ_DITHER_ORDERED, "ordered",         "Ordered (Bayer 8x8)")
+  enum_value (GEGL_PQ_DITHER_FS,      "floyd-steinberg", "Floyd-Steinberg")
+enum_end (GeglPaletteQuantizeDither)
+
 property_string (palette, "Palette", "#000000;#ffffff")
   description ("Palette colors as separated #RRGGBB values")
 
@@ -37,6 +48,11 @@ property_enum (metric, "Metric",
                GeglPaletteQuantizeMetric, gegl_palette_quantize_metric,
                GEGL_PQ_METRIC_SRGB)
   description ("Color space in which nearest-color distance is measured")
+
+property_enum (dither, "Dithering",
+               GeglPaletteQuantizeDither, gegl_palette_quantize_dither,
+               GEGL_PQ_DITHER_NONE)
+  description ("Dithering method used to distribute quantization error")
 
 property_double (strength, "Strength", 1.0)
   value_range (0.0, 1.0)
@@ -46,7 +62,7 @@ property_double (strength, "Strength", 1.0)
 
 #else
 
-#define GEGL_OP_POINT_FILTER
+#define GEGL_OP_FILTER
 #define GEGL_OP_NAME     palette_quantize
 #define GEGL_OP_C_SOURCE gegl-palette-quantize.c
 
@@ -57,6 +73,10 @@ property_double (strength, "Strength", 1.0)
 
 #include "gegl-op.h"
 
+/* LUT resolution per channel. 64 -> 64^3 = 262144 cells, 512 KB of guint16.
+ * Boundary error is < 1/64 per channel, sub-perceptual for quantization. */
+#define LUT_R 64
+
 typedef struct
 {
   gfloat r;
@@ -64,18 +84,28 @@ typedef struct
   gfloat b;
 } PaletteColor;
 
-/* Parsed-and-prepared palette, cached on the operation between tiles. Built
- * once in prepare() (single-threaded); process() only reads it, which is
- * required because point-filter process() runs concurrently across tiles. */
+/* Parsed-and-prepared palette + matching LUT, cached on the operation. Built
+ * once in prepare() (single-threaded); process() only reads it. */
 typedef struct
 {
-  gchar      *palette;   /* copy of the source string, for change detection  */
-  gint        metric;    /* metric the coords were built for                 */
-  guint       n;         /* number of palette colors                         */
-  gfloat     *srgb;      /* n * 3, sRGB 0..1 — written to the output         */
-  gfloat     *coord;     /* n * 3, palette colors in the metric space        */
-  const Babl *to_coord;  /* fish: "R'G'B'A float" -> metric space (3 ch)     */
+  gchar    *palette;   /* copy of the source string, for change detection  */
+  gint      metric;    /* metric the LUT was built for                     */
+  guint     n;         /* number of palette colors                         */
+  gfloat   *srgb;      /* n * 3, sRGB 0..1 — written to the output         */
+  guint16  *lut;       /* LUT_R^3, palette index per quantized sRGB cell   */
+  gfloat    amp;       /* ordered-dither amplitude (mean palette spacing)  */
 } PaletteCache;
+
+static const gint bayer8[8][8] = {
+  {  0, 32,  8, 40,  2, 34, 10, 42 },
+  { 48, 16, 56, 24, 50, 18, 58, 26 },
+  { 12, 44,  4, 36, 14, 46,  6, 38 },
+  { 60, 28, 52, 20, 62, 30, 54, 22 },
+  {  3, 35, 11, 43,  1, 33,  9, 41 },
+  { 51, 19, 59, 27, 49, 17, 57, 25 },
+  { 15, 47,  7, 39, 13, 45,  5, 37 },
+  { 63, 31, 55, 23, 61, 29, 53, 21 }
+};
 
 static const gchar *
 metric_format (gint metric)
@@ -166,8 +196,35 @@ palette_cache_free (PaletteCache *c)
     return;
   g_free (c->palette);
   g_free (c->srgb);
-  g_free (c->coord);
+  g_free (c->lut);
   g_free (c);
+}
+
+static inline gfloat
+sqdist3 (const gfloat *a, const gfloat *b)
+{
+  gfloat d0 = a[0] - b[0];
+  gfloat d1 = a[1] - b[1];
+  gfloat d2 = a[2] - b[2];
+  return d0 * d0 + d1 * d1 + d2 * d2;
+}
+
+static guint
+nearest_in (const gfloat *p, const gfloat *coord, guint n)
+{
+  guint  best   = 0;
+  gfloat best_d = G_MAXFLOAT;
+
+  for (guint i = 0; i < n; i++)
+    {
+      gfloat d = sqdist3 (p, coord + i * 3);
+      if (d < best_d)
+        {
+          best_d = d;
+          best   = i;
+        }
+    }
+  return best;
 }
 
 static PaletteCache *
@@ -177,12 +234,16 @@ palette_cache_build (const gchar *palette_str, gint metric)
   guint         n      = colors->len;
   PaletteCache *c      = g_new0 (PaletteCache, 1);
   const Babl   *fmt    = babl_format (metric_format (metric));
+  const Babl   *to_m   = babl_fish (babl_format ("R'G'B' float"), fmt);
+  gfloat       *coord;        /* palette colors in metric space            */
+  gfloat       *centers;      /* LUT cell centers, sRGB                     */
+  gfloat       *centers_m;    /* LUT cell centers, metric space            */
+  gsize         cells   = (gsize) LUT_R * LUT_R * LUT_R;
 
   c->palette = g_strdup (palette_str ? palette_str : "");
   c->metric  = metric;
   c->n       = n;
   c->srgb    = g_new (gfloat, (gsize) n * 3);
-  c->coord   = g_new (gfloat, (gsize) n * 3);
 
   for (guint i = 0; i < n; i++)
     {
@@ -192,97 +253,258 @@ palette_cache_build (const gchar *palette_str, gint metric)
       c->srgb[i * 3 + 2] = pc.b;
     }
 
-  /* Convert the whole palette into the metric space once. */
-  babl_process (babl_fish (babl_format ("R'G'B' float"), fmt),
-                c->srgb, c->coord, n);
+  coord = g_new (gfloat, (gsize) n * 3);
+  babl_process (to_m, c->srgb, coord, n);
 
-  /* Fish used per tile to convert incoming pixels (drops alpha). */
-  c->to_coord = babl_fish (babl_format ("R'G'B'A float"), fmt);
+  /* Ordered-dither amplitude: mean distance (in sRGB) from each palette color
+   * to its nearest neighbor — a reasonable "quantization step". */
+  c->amp = 0.0f;
+  if (n > 1)
+    {
+      gfloat acc = 0.0f;
+      for (guint i = 0; i < n; i++)
+        {
+          gfloat best = G_MAXFLOAT;
+          for (guint j = 0; j < n; j++)
+            if (j != i)
+              {
+                gfloat d = sqdist3 (c->srgb + i * 3, c->srgb + j * 3);
+                if (d < best) best = d;
+              }
+          acc += sqrtf (best);
+        }
+      c->amp = acc / n;
+    }
 
+  /* Build the nearest-color LUT in the metric space. */
+  c->lut    = g_new (guint16, cells);
+  centers   = g_new (gfloat, cells * 3);
+  centers_m = g_new (gfloat, cells * 3);
+
+  {
+    gsize idx = 0;
+    for (gint ir = 0; ir < LUT_R; ir++)
+      for (gint ig = 0; ig < LUT_R; ig++)
+        for (gint ib = 0; ib < LUT_R; ib++, idx++)
+          {
+            centers[idx * 3 + 0] = (ir + 0.5f) / LUT_R;
+            centers[idx * 3 + 1] = (ig + 0.5f) / LUT_R;
+            centers[idx * 3 + 2] = (ib + 0.5f) / LUT_R;
+          }
+  }
+
+  babl_process (to_m, centers, centers_m, cells);
+
+  for (gsize i = 0; i < cells; i++)
+    c->lut[i] = (guint16) nearest_in (centers_m + i * 3, coord, n);
+
+  g_free (centers);
+  g_free (centers_m);
+  g_free (coord);
   g_array_unref (colors);
   return c;
 }
 
 static inline guint
-nearest_index (const gfloat *p, const PaletteCache *c)
+lut_lookup (const PaletteCache *c, gfloat r, gfloat g, gfloat b)
 {
-  guint  best   = 0;
-  gfloat best_d = G_MAXFLOAT;
+  gint ir = (gint) (CLAMP (r, 0.0f, 1.0f) * LUT_R);
+  gint ig = (gint) (CLAMP (g, 0.0f, 1.0f) * LUT_R);
+  gint ib = (gint) (CLAMP (b, 0.0f, 1.0f) * LUT_R);
 
-  for (guint i = 0; i < c->n; i++)
+  if (ir >= LUT_R) ir = LUT_R - 1;
+  if (ig >= LUT_R) ig = LUT_R - 1;
+  if (ib >= LUT_R) ib = LUT_R - 1;
+
+  return c->lut[((gsize) ir * LUT_R + ig) * LUT_R + ib];
+}
+
+/* -------- per-mode processing over an interleaved R'G'B'A float buffer ----- */
+
+static void
+process_simple (const PaletteCache *c, gfloat *buf, glong w, glong h,
+                glong ox, glong oy, gfloat strength, gboolean ordered)
+{
+  for (glong y = 0; y < h; y++)
+    for (glong x = 0; x < w; x++)
+      {
+        gfloat *px = buf + ((gsize) y * w + x) * 4;
+        gfloat  a  = px[3];
+        gfloat  mr, mg, mb;
+        guint   idx;
+
+        if (a <= 0.0f)
+          continue;
+
+        mr = px[0]; mg = px[1]; mb = px[2];
+
+        if (ordered)
+          {
+            gint  bx  = (gint) ((ox + x) & 7);
+            gint  by  = (gint) ((oy + y) & 7);
+            gfloat off = (((bayer8[by][bx] + 0.5f) / 64.0f) - 0.5f) * c->amp;
+            mr += off; mg += off; mb += off;
+          }
+
+        idx = lut_lookup (c, mr, mg, mb);
+
+        px[0] = px[0] + (c->srgb[idx * 3 + 0] - px[0]) * strength;
+        px[1] = px[1] + (c->srgb[idx * 3 + 1] - px[1]) * strength;
+        px[2] = px[2] + (c->srgb[idx * 3 + 2] - px[2]) * strength;
+      }
+}
+
+static void
+process_floyd_steinberg (const PaletteCache *c, gfloat *buf, glong w, glong h,
+                         gfloat strength)
+{
+  gfloat *work = g_new (gfloat, (gsize) w * h * 3);
+
+  for (gsize i = 0; i < (gsize) w * h; i++)
     {
-      const gfloat *q  = c->coord + i * 3;
-      gfloat        d0 = p[0] - q[0];
-      gfloat        d1 = p[1] - q[1];
-      gfloat        d2 = p[2] - q[2];
-      gfloat        d  = d0 * d0 + d1 * d1 + d2 * d2;
-
-      if (d < best_d)
-        {
-          best_d = d;
-          best   = i;
-        }
+      work[i * 3 + 0] = buf[i * 4 + 0];
+      work[i * 3 + 1] = buf[i * 4 + 1];
+      work[i * 3 + 2] = buf[i * 4 + 2];
     }
 
-  return best;
+  for (glong y = 0; y < h; y++)
+    for (glong x = 0; x < w; x++)
+      {
+        gsize   p  = (gsize) y * w + x;
+        gfloat *px = buf + p * 4;
+        gfloat *wk = work + p * 3;
+        gfloat  a  = px[3];
+        guint   idx;
+        gfloat  er, eg, eb;
+
+        if (a <= 0.0f)
+          continue;  /* leave transparent pixels untouched, no diffusion */
+
+        idx = lut_lookup (c, wk[0], wk[1], wk[2]);
+
+        er = wk[0] - c->srgb[idx * 3 + 0];
+        eg = wk[1] - c->srgb[idx * 3 + 1];
+        eb = wk[2] - c->srgb[idx * 3 + 2];
+
+        /* Floyd-Steinberg distribution: 7/16, 3/16, 5/16, 1/16. */
+        if (x + 1 < w)
+          {
+            gfloat *n = work + (p + 1) * 3;
+            n[0] += er * (7.0f / 16.0f);
+            n[1] += eg * (7.0f / 16.0f);
+            n[2] += eb * (7.0f / 16.0f);
+          }
+        if (y + 1 < h)
+          {
+            if (x > 0)
+              {
+                gfloat *n = work + (p + w - 1) * 3;
+                n[0] += er * (3.0f / 16.0f);
+                n[1] += eg * (3.0f / 16.0f);
+                n[2] += eb * (3.0f / 16.0f);
+              }
+            {
+              gfloat *n = work + (p + w) * 3;
+              n[0] += er * (5.0f / 16.0f);
+              n[1] += eg * (5.0f / 16.0f);
+              n[2] += eb * (5.0f / 16.0f);
+            }
+            if (x + 1 < w)
+              {
+                gfloat *n = work + (p + w + 1) * 3;
+                n[0] += er * (1.0f / 16.0f);
+                n[1] += eg * (1.0f / 16.0f);
+                n[2] += eb * (1.0f / 16.0f);
+              }
+          }
+
+        px[0] = px[0] + (c->srgb[idx * 3 + 0] - px[0]) * strength;
+        px[1] = px[1] + (c->srgb[idx * 3 + 1] - px[1]) * strength;
+        px[2] = px[2] + (c->srgb[idx * 3 + 2] - px[2]) * strength;
+      }
+
+  g_free (work);
 }
 
 static gboolean
 process (GeglOperation       *operation,
-         void                *in_buf,
-         void                *out_buf,
-         glong                n_pixels,
+         GeglBuffer          *input,
+         GeglBuffer          *output,
          const GeglRectangle *roi,
          gint                 level)
 {
-  GeglProperties     *o = GEGL_PROPERTIES (operation);
-  const PaletteCache *c = o->user_data;
-  const gfloat       *src = in_buf;
-  gfloat             *dst = out_buf;
-  gfloat             *coords;
+  GeglProperties     *o      = GEGL_PROPERTIES (operation);
+  const PaletteCache *c      = o->user_data;
+  const Babl         *format = babl_format ("R'G'B'A float");
+  gfloat             *buf;
   gfloat              strength;
 
-  (void) roi;
   (void) level;
 
-  if (! c)   /* should have been built in prepare(); defensive only */
+  if (! c || roi->width <= 0 || roi->height <= 0)
     return TRUE;
 
   strength = CLAMP ((gfloat) o->strength, 0.0f, 1.0f);
 
-  /* Convert this tile's pixels into the metric space in one shot. */
-  coords = g_new (gfloat, (gsize) n_pixels * 3);
-  babl_process (c->to_coord, in_buf, coords, n_pixels);
+  buf = g_new (gfloat, (gsize) roi->width * roi->height * 4);
+  gegl_buffer_get (input, roi, 1.0, format, buf,
+                   GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_CLAMP);
 
-  for (glong i = 0; i < n_pixels; i++)
+  switch (o->dither)
     {
-      const gfloat a = src[3];
-
-      if (a <= 0.0f)
-        {
-          dst[0] = src[0];
-          dst[1] = src[1];
-          dst[2] = src[2];
-          dst[3] = a;
-        }
-      else
-        {
-          guint        idx = nearest_index (coords + i * 3, c);
-          const gfloat *q  = c->srgb + idx * 3;
-
-          dst[0] = src[0] + (q[0] - src[0]) * strength;
-          dst[1] = src[1] + (q[1] - src[1]) * strength;
-          dst[2] = src[2] + (q[2] - src[2]) * strength;
-          dst[3] = a;
-        }
-
-      src += 4;
-      dst += 4;
+    case GEGL_PQ_DITHER_FS:
+      process_floyd_steinberg (c, buf, roi->width, roi->height, strength);
+      break;
+    case GEGL_PQ_DITHER_ORDERED:
+      process_simple (c, buf, roi->width, roi->height,
+                      roi->x, roi->y, strength, TRUE);
+      break;
+    case GEGL_PQ_DITHER_NONE:
+    default:
+      process_simple (c, buf, roi->width, roi->height,
+                      roi->x, roi->y, strength, FALSE);
+      break;
     }
 
-  g_free (coords);
+  gegl_buffer_set (output, roi, 0, format, buf, GEGL_AUTO_ROWSTRIDE);
+  g_free (buf);
 
   return TRUE;
+}
+
+/* Floyd-Steinberg must see the whole image in one process() call, otherwise
+ * error diffusion would produce visible seams at tile boundaries. */
+static GeglRectangle
+get_required_for_output (GeglOperation       *operation,
+                         const gchar         *input_pad,
+                         const GeglRectangle *roi)
+{
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+
+  (void) input_pad;
+
+  if (o->dither == GEGL_PQ_DITHER_FS)
+    {
+      GeglRectangle *in = gegl_operation_source_get_bounding_box (operation, "input");
+      if (in)
+        return *in;
+    }
+  return *roi;
+}
+
+static GeglRectangle
+get_cached_region (GeglOperation       *operation,
+                   const GeglRectangle *roi)
+{
+  GeglProperties *o = GEGL_PROPERTIES (operation);
+
+  if (o->dither == GEGL_PQ_DITHER_FS)
+    {
+      GeglRectangle *in = gegl_operation_source_get_bounding_box (operation, "input");
+      if (in)
+        return *in;
+    }
+  return *roi;
 }
 
 static void
@@ -294,8 +516,8 @@ prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "input", format);
   gegl_operation_set_format (operation, "output", format);
 
-  /* (Re)build the palette cache whenever the inputs change. prepare() is
-   * single-threaded, so this is the safe place to touch user_data. */
+  /* (Re)build the palette cache + LUT whenever the inputs change. prepare()
+   * is single-threaded, so this is the safe place to touch user_data. */
   palette_cache_free (o->user_data);
   o->user_data = palette_cache_build (o->palette, o->metric);
 }
@@ -314,23 +536,25 @@ finalize (GObject *object)
 static void
 gegl_op_class_init (GeglOpClass *klass)
 {
-  GObjectClass                  *object_class;
-  GeglOperationClass            *operation_class;
-  GeglOperationPointFilterClass *point_filter_class;
+  GObjectClass             *object_class;
+  GeglOperationClass       *operation_class;
+  GeglOperationFilterClass *filter_class;
 
-  object_class       = G_OBJECT_CLASS (klass);
-  operation_class    = GEGL_OPERATION_CLASS (klass);
-  point_filter_class = GEGL_OPERATION_POINT_FILTER_CLASS (klass);
+  object_class    = G_OBJECT_CLASS (klass);
+  operation_class = GEGL_OPERATION_CLASS (klass);
+  filter_class    = GEGL_OPERATION_FILTER_CLASS (klass);
 
-  object_class->finalize       = finalize;
-  operation_class->prepare     = prepare;
-  point_filter_class->process  = process;
+  object_class->finalize                   = finalize;
+  operation_class->prepare                 = prepare;
+  operation_class->get_required_for_output = get_required_for_output;
+  operation_class->get_cached_region       = get_cached_region;
+  filter_class->process                    = process;
 
   gegl_operation_class_set_keys (operation_class,
                                  "name",        "custom:palette-quantize",
                                  "title",       "Palette Quantize",
                                  "categories",  "color:palette",
-                                 "description", "Map every pixel to the nearest color in a supplied palette.",
+                                 "description", "Map every pixel to the nearest color in a supplied palette, with optional dithering.",
                                  NULL);
 }
 

@@ -141,6 +141,27 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                                         G_PARAM_READWRITE);
   }
 
+  /* Dithering method. Nicks MUST match the GEGL op's
+   * GeglPaletteQuantizeDither enum nicks. */
+  {
+    GimpChoice *dither = gimp_choice_new ();
+
+    gimp_choice_add (dither, "none",            0, "None",
+                     "Hard nearest-color quantization");
+    gimp_choice_add (dither, "ordered",         1, "Ordered (Bayer 8x8)",
+                     "Position-based ordered dithering");
+    gimp_choice_add (dither, "floyd-steinberg", 2, "Floyd-Steinberg",
+                     "Error-diffusion dithering (whole layer)");
+
+    gimp_procedure_add_choice_argument (procedure,
+                                        "dither",
+                                        "_Dithering",
+                                        "Dithering method used to distribute quantization error",
+                                        dither,
+                                        "none",
+                                        G_PARAM_READWRITE);
+  }
+
   return procedure;
 }
 
@@ -196,6 +217,7 @@ show_dialog (GimpProcedure       *procedure,
   gimp_procedure_dialog_fill (GIMP_PROCEDURE_DIALOG (dialog),
                               "palette",
                               "metric",
+                              "dither",
                               "strength",
                               "non-destructive",
                               NULL);
@@ -220,6 +242,7 @@ palette_quantize_run (GimpProcedure        *procedure,
   gdouble           strength = 1.0;
   gboolean          non_destructive = TRUE;
   gchar            *metric = NULL;
+  gchar            *dither = NULL;
   gint              n_drawables;
 
   (void) run_data;
@@ -245,14 +268,17 @@ palette_quantize_run (GimpProcedure        *procedure,
                 "strength", &strength,
                 "non-destructive", &non_destructive,
                 "metric", &metric,
+                "dither", &dither,
                 NULL);
 
-  /* GIMP mirrors the GEGL op's enum "metric" into the drawable-filter config
-   * as a nick string, so it must be passed to *_new_filter() as a const gchar*
-   * (passing the integer id would be read as a bogus pointer and crash). Our
+  /* GIMP mirrors the GEGL op's enum properties into the drawable-filter config
+   * as nick strings, so they must be passed to *_new_filter() as const gchar*
+   * (passing an integer id would be read as a bogus pointer and crash). Our
    * GimpChoice nicks intentionally match the GEGL enum nicks. */
   if (! metric)
     metric = g_strdup ("srgb");
+  if (! dither)
+    dither = g_strdup ("none");
 
   strength = CLAMP (strength, 0.0, 1.0);
   hex_palette = palette_to_hex_string (palette, &error);
@@ -261,6 +287,7 @@ palette_quantize_run (GimpProcedure        *procedure,
   if (! hex_palette)
     {
       g_free (metric);
+      g_free (dither);
       return gimp_procedure_new_return_values (procedure, GIMP_PDB_CALLING_ERROR, error);
     }
 
@@ -277,6 +304,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                                 1.0,
                                                 "palette", hex_palette,
                                                 "metric", metric,
+                                                "dither", dither,
                                                 "strength", strength,
                                                 NULL);
       if (! filter)
@@ -288,6 +316,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                           1.0,
                                           "palette", hex_palette,
                                           "metric", metric,
+                                          "dither", dither,
                                           "strength", strength,
                                           NULL);
         }
@@ -301,6 +330,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       1.0,
                                       "palette", hex_palette,
                                       "metric", metric,
+                                      "dither", dither,
                                       "strength", strength,
                                       NULL);
     }
@@ -310,6 +340,7 @@ palette_quantize_run (GimpProcedure        *procedure,
 
   g_free (hex_palette);
   g_free (metric);
+  g_free (dither);
 
   return gimp_procedure_new_return_values (procedure, status, NULL);
 }

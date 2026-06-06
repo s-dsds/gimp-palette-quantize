@@ -24,6 +24,18 @@ The **Metric** dropdown controls only *how* the nearest color is chosen.
 `sRGB`/`linear` are fast RGB-distance modes; `CIE Lab`/`OKLab` are perceptual
 and usually give more natural matches for photographic content.
 
+The **Dithering** dropdown distributes quantization error to reduce banding:
+
+- `None` — hard nearest-color mapping.
+- `Ordered (Bayer 8x8)` — fast, position-based; tiles seamlessly and previews
+  cheaply.
+- `Floyd-Steinberg` — error diffusion; higher quality, but processes the whole
+  layer at once (heavier for large layers / live previews).
+
+Nearest-color matching is served by a precomputed 3D lookup table built once
+per parameter change, so processing is fast and roughly independent of palette
+size.
+
 ## Build & install guides
 
 Pick the guide matching your platform — these cover the real, tested paths:
@@ -80,14 +92,20 @@ Restart GIMP.
 1. Select a layer or layer group in the Layers dock.
 2. Run `Filters > Color > Quantize to Palette...`.
 3. Pick a palette from the GIMP palette selector.
-4. Keep `Non-destructive layer filter` enabled to append a live filter when GIMP accepts it. Disable it to merge destructively.
+4. Choose a `Metric` (how nearest color is measured) and a `Dithering` method.
+5. Adjust `Strength` to blend the result with the original.
+6. Keep `Non-destructive layer filter` enabled to append a live filter when GIMP accepts it. Disable it to merge destructively.
 
 You can also use the GEGL operation directly through GIMP's GEGL operation dialog by choosing `custom:palette-quantize`, but that lower-level route requires entering the palette as a `#RRGGBB;#RRGGBB` string rather than choosing from GIMP's palette list.
 
 ## Notes and limitations
 
-- This is nearest-color quantization with selectable distance metrics
-  (sRGB, linear, CIE Lab, OKLab). It does not yet implement dithering.
+- Nearest-color quantization with selectable distance metrics (sRGB, linear,
+  CIE Lab, OKLab) and dithering (none, ordered Bayer, Floyd-Steinberg).
+- The matching LUT is 64 levels per channel; near Voronoi-cell boundaries a
+  pixel may map to a neighboring palette color (sub-perceptual in practice).
+- Floyd-Steinberg forces whole-layer processing (to avoid tile seams), so it is
+  slower than the other modes for large layers and non-destructive previews.
 - Non-destructive filters are available for layers; in GIMP 3.2, layer groups are layers, so selecting a group should work when the custom GEGL op is loaded.
 - If GIMP cannot append the filter non-destructively to the selected drawable, the wrapper falls back to merging the GEGL operation.
 - I could not compile-test this in the ChatGPT container because the container does not include GIMP/GEGL development headers. The code follows the GIMP 3.2.4 libgimp API docs, but you may still need small distro-specific include/link adjustments.
