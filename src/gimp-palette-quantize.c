@@ -1,0 +1,315 @@
+/*
+ * gimp-palette-quantize.c
+ *
+ * GIMP 3.2+ plug-in wrapper for the GEGL operation
+ *   custom:palette-quantize
+ *
+ * It shows a native GIMP palette selector, converts the selected GimpPalette
+ * to the GEGL op's inline hex palette string, then appends or merges the GEGL
+ * filter on the selected drawable/layer/group.
+ */
+
+#include <glib.h>
+#include <math.h>
+#include <string.h>
+#include <libgimp/gimp.h>
+#include <libgimp/gimpui.h>
+#include <gegl.h>
+#include <babl/babl.h>
+
+#define PLUG_IN_PROC   "plug-in-palette-quantize-group"
+#define PLUG_IN_BINARY "gimp-palette-quantize"
+#define GEGL_OP_NAME   "custom:palette-quantize"
+
+struct _PaletteQuantize
+{
+  GimpPlugIn parent_instance;
+};
+
+#define PALETTE_QUANTIZE_TYPE (palette_quantize_get_type ())
+G_DECLARE_FINAL_TYPE (PaletteQuantize, palette_quantize, PALETTE, QUANTIZE, GimpPlugIn)
+
+static GList          * palette_quantize_query_procedures (GimpPlugIn           *plug_in);
+static GimpProcedure  * palette_quantize_create_procedure (GimpPlugIn           *plug_in,
+                                                           const gchar          *name);
+static GimpValueArray * palette_quantize_run              (GimpProcedure        *procedure,
+                                                           GimpRunMode           run_mode,
+                                                           GimpImage            *image,
+                                                           GimpDrawable        **drawables,
+                                                           GimpProcedureConfig  *config,
+                                                           gpointer              run_data);
+
+G_DEFINE_TYPE (PaletteQuantize, palette_quantize, GIMP_TYPE_PLUG_IN)
+GIMP_MAIN (PALETTE_QUANTIZE_TYPE)
+
+static void
+palette_quantize_class_init (PaletteQuantizeClass *klass)
+{
+  GimpPlugInClass *plug_in_class = GIMP_PLUG_IN_CLASS (klass);
+
+  plug_in_class->query_procedures = palette_quantize_query_procedures;
+  plug_in_class->create_procedure = palette_quantize_create_procedure;
+}
+
+static void
+palette_quantize_init (PaletteQuantize *self)
+{
+  (void) self;
+}
+
+static GList *
+palette_quantize_query_procedures (GimpPlugIn *plug_in)
+{
+  (void) plug_in;
+  return g_list_append (NULL, g_strdup (PLUG_IN_PROC));
+}
+
+static GimpProcedure *
+palette_quantize_create_procedure (GimpPlugIn  *plug_in,
+                                   const gchar *name)
+{
+  GimpProcedure *procedure = NULL;
+
+  if (g_strcmp0 (name, PLUG_IN_PROC) != 0)
+    return NULL;
+
+  procedure = gimp_image_procedure_new (plug_in, name,
+                                        GIMP_PDB_PROC_TYPE_PLUGIN,
+                                        palette_quantize_run,
+                                        NULL, NULL);
+
+  gimp_procedure_set_image_types (procedure, "RGB*, GRAY*");
+  gimp_procedure_set_sensitivity_mask (procedure,
+                                       GIMP_PROCEDURE_SENSITIVE_DRAWABLE |
+                                       GIMP_PROCEDURE_SENSITIVE_DRAWABLES);
+  gimp_procedure_set_menu_label (procedure, "Quantize to _Palette...");
+  gimp_procedure_add_menu_path (procedure, "<Image>/Filters/Color/");
+  gimp_procedure_set_documentation (procedure,
+                                    "Limit the selected layer or layer group to a GIMP palette",
+                                    "Adds or merges a GEGL filter that maps every visible pixel "
+                                    "of the selected drawable to the nearest color in a selected "
+                                    "GIMP palette. Alpha is preserved.",
+                                    NULL);
+  gimp_procedure_set_attribution (procedure,
+                                  "OpenAI ChatGPT",
+                                  "OpenAI ChatGPT",
+                                  "2026");
+
+  gimp_procedure_add_palette_argument (procedure,
+                                       "palette",
+                                       "_Palette",
+                                       "Palette whose colors should be enforced",
+                                       FALSE,
+                                       NULL,
+                                       TRUE,
+                                       G_PARAM_READWRITE);
+
+  gimp_procedure_add_double_argument (procedure,
+                                      "strength",
+                                      "_Strength",
+                                      "Blend between the original color and nearest palette color",
+                                      0.0, 1.0, 1.0,
+                                      G_PARAM_READWRITE);
+
+  gimp_procedure_add_boolean_argument (procedure,
+                                       "non-destructive",
+                                       "_Non-destructive layer filter",
+                                       "Append as a non-destructive layer/group filter when possible; otherwise merge destructively",
+                                       TRUE,
+                                       G_PARAM_READWRITE);
+
+  /* Color distance metric. The ids MUST match the GEGL op's
+   * GeglPaletteQuantizeMetric enum values (0=srgb, 1=linear, 2=lab, 3=oklab). */
+  {
+    GimpChoice *metric = gimp_choice_new ();
+
+    gimp_choice_add (metric, "srgb",    0, "sRGB Euclidean",
+                     "Nearest color in sRGB (fast, default)");
+    gimp_choice_add (metric, "linear",  1, "Linear RGB",
+                     "Nearest color in linear-light RGB");
+    gimp_choice_add (metric, "cie-lab", 2, "CIE Lab (perceptual)",
+                     "Nearest color in CIE Lab");
+    gimp_choice_add (metric, "oklab",   3, "OKLab (perceptual)",
+                     "Nearest color in OKLab");
+
+    gimp_procedure_add_choice_argument (procedure,
+                                        "metric",
+                                        "_Metric",
+                                        "Color space used to pick the nearest palette color",
+                                        metric,
+                                        "srgb",
+                                        G_PARAM_READWRITE);
+  }
+
+  return procedure;
+}
+
+static gchar *
+palette_to_hex_string (GimpPalette *palette, GError **error)
+{
+  const Babl *format;
+  guint8     *map = NULL;
+  gint        n_colors = 0;
+  gsize       n_bytes = 0;
+  GString    *out;
+
+  if (! GIMP_IS_PALETTE (palette))
+    {
+      g_set_error (error, GIMP_PLUG_IN_ERROR, 0, "No valid palette was selected.");
+      return NULL;
+    }
+
+  format = babl_format ("R'G'B' u8");
+  map = gimp_palette_get_colormap (palette, format, &n_colors, &n_bytes);
+
+  if (! map || n_colors <= 0 || n_bytes < 3)
+    {
+      g_free (map);
+      g_set_error (error, GIMP_PLUG_IN_ERROR, 0, "The selected palette contains no RGB colors.");
+      return NULL;
+    }
+
+  out = g_string_sized_new ((gsize) n_colors * 8);
+  for (gint i = 0; i < n_colors; i++)
+    {
+      const guint8 *p = map + (i * 3);
+      g_string_append_printf (out, "#%02x%02x%02x", p[0], p[1], p[2]);
+      if (i + 1 < n_colors)
+        g_string_append_c (out, ';');
+    }
+
+  g_free (map);
+  return g_string_free (out, FALSE);
+}
+
+static gboolean
+show_dialog (GimpProcedure       *procedure,
+             GimpProcedureConfig *config)
+{
+  GtkWidget *dialog;
+  gboolean   run;
+
+  gimp_ui_init (PLUG_IN_BINARY);
+
+  dialog = gimp_procedure_dialog_new (procedure, config,
+                                      "Quantize to Palette");
+  gimp_procedure_dialog_fill (GIMP_PROCEDURE_DIALOG (dialog),
+                              "palette",
+                              "metric",
+                              "strength",
+                              "non-destructive",
+                              NULL);
+  run = gimp_procedure_dialog_run (GIMP_PROCEDURE_DIALOG (dialog));
+  gtk_widget_destroy (dialog);
+
+  return run;
+}
+
+static GimpValueArray *
+palette_quantize_run (GimpProcedure        *procedure,
+                      GimpRunMode           run_mode,
+                      GimpImage            *image,
+                      GimpDrawable        **drawables,
+                      GimpProcedureConfig  *config,
+                      gpointer              run_data)
+{
+  GimpPDBStatusType status = GIMP_PDB_SUCCESS;
+  GError           *error = NULL;
+  GimpPalette      *palette = NULL;
+  gchar            *hex_palette = NULL;
+  gdouble           strength = 1.0;
+  gboolean          non_destructive = TRUE;
+  gchar            *metric = NULL;
+  gint              n_drawables;
+
+  (void) run_data;
+
+  gegl_init (NULL, NULL);
+
+  n_drawables = gimp_core_object_array_get_length ((GObject **) drawables);
+  if (n_drawables != 1)
+    {
+      g_set_error (&error, GIMP_PLUG_IN_ERROR, 0,
+                   "Select exactly one layer or layer group before running this filter.");
+      return gimp_procedure_new_return_values (procedure, GIMP_PDB_CALLING_ERROR, error);
+    }
+
+  if (run_mode == GIMP_RUN_INTERACTIVE)
+    {
+      if (! show_dialog (procedure, config))
+        return gimp_procedure_new_return_values (procedure, GIMP_PDB_CANCEL, NULL);
+    }
+
+  g_object_get (config,
+                "palette", &palette,
+                "strength", &strength,
+                "non-destructive", &non_destructive,
+                "metric", &metric,
+                NULL);
+
+  /* GIMP mirrors the GEGL op's enum "metric" into the drawable-filter config
+   * as a nick string, so it must be passed to *_new_filter() as a const gchar*
+   * (passing the integer id would be read as a bogus pointer and crash). Our
+   * GimpChoice nicks intentionally match the GEGL enum nicks. */
+  if (! metric)
+    metric = g_strdup ("srgb");
+
+  strength = CLAMP (strength, 0.0, 1.0);
+  hex_palette = palette_to_hex_string (palette, &error);
+  g_clear_object (&palette);
+
+  if (! hex_palette)
+    {
+      g_free (metric);
+      return gimp_procedure_new_return_values (procedure, GIMP_PDB_CALLING_ERROR, error);
+    }
+
+  gimp_image_undo_group_start (image);
+
+  if (non_destructive)
+    {
+      GimpDrawableFilter *filter;
+
+      filter = gimp_drawable_append_new_filter (drawables[0],
+                                                GEGL_OP_NAME,
+                                                "Palette Quantize",
+                                                GIMP_LAYER_MODE_REPLACE,
+                                                1.0,
+                                                "palette", hex_palette,
+                                                "metric", metric,
+                                                "strength", strength,
+                                                NULL);
+      if (! filter)
+        {
+          gimp_drawable_merge_new_filter (drawables[0],
+                                          GEGL_OP_NAME,
+                                          "Palette Quantize",
+                                          GIMP_LAYER_MODE_REPLACE,
+                                          1.0,
+                                          "palette", hex_palette,
+                                          "metric", metric,
+                                          "strength", strength,
+                                          NULL);
+        }
+    }
+  else
+    {
+      gimp_drawable_merge_new_filter (drawables[0],
+                                      GEGL_OP_NAME,
+                                      "Palette Quantize",
+                                      GIMP_LAYER_MODE_REPLACE,
+                                      1.0,
+                                      "palette", hex_palette,
+                                      "metric", metric,
+                                      "strength", strength,
+                                      NULL);
+    }
+
+  gimp_image_undo_group_end (image);
+  gimp_displays_flush ();
+
+  g_free (hex_palette);
+  g_free (metric);
+
+  return gimp_procedure_new_return_values (procedure, status, NULL);
+}

@@ -1,0 +1,10 @@
+# Meson build output
+/build/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+
+# Claude Code harness state
+/.claude/

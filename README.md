@@ -1,0 +1,93 @@
+# GIMP 3.2 Palette Quantize Filter
+
+This project provides a GEGL operation plus a GIMP 3 plug-in wrapper for enforcing a chosen GIMP palette on a selected layer or layer group.
+
+## What it installs
+
+- `custom:palette-quantize`: a GEGL point-filter operation.
+- `plug-in-palette-quantize-group`: a GIMP plug-in entry at `Filters > Color > Quantize to Palette...`.
+
+The plug-in uses GIMP's native palette argument, so the dialog can select from GIMP's palette resources. It converts the chosen palette to the inline palette string expected by the GEGL op, then either appends the op as a non-destructive drawable filter or merges it destructively.
+
+## Behavior
+
+For each non-transparent pixel:
+
+1. Find the nearest palette entry, measuring distance in the selected metric
+   (sRGB Euclidean, linear RGB, CIE Lab, or OKLab).
+2. Replace the pixel RGB with that palette color (always the exact sRGB
+   palette color, so it round-trips to the picked `#RRGGBB`).
+3. Preserve alpha.
+4. Optionally blend with the original color using `strength`.
+
+The **Metric** dropdown controls only *how* the nearest color is chosen.
+`sRGB`/`linear` are fast RGB-distance modes; `CIE Lab`/`OKLab` are perceptual
+and usually give more natural matches for photographic content.
+
+## Build & install guides
+
+Pick the guide matching your platform — these cover the real, tested paths:
+
+- **Linux with a Flatpak GIMP** (e.g. Ubuntu, where GIMP 3 isn't in apt): see
+  [`BUILDING.md`](BUILDING.md). Use `./build-install-flatpak.sh`.
+- **Windows** (MSYS2 / MinGW-w64): see
+  [`BUILDING-windows.md`](BUILDING-windows.md). Use `./build-install-msys2.sh`.
+- **Linux with native GIMP 3 dev packages**: the generic steps below, or
+  `install-linux-user.sh`.
+
+## Requirements
+
+- GIMP 3.2.x development files, including `gimp-3.0` and `gimpui-3.0` pkg-config packages.
+- GEGL 0.4 development files.
+- babl, GLib, Meson, Ninja, and a C compiler.
+
+On Linux package names vary. They are often similar to:
+
+```bash
+sudo apt install build-essential meson ninja-build libgegl-dev libbabl-dev libgimp-3.0-dev
+```
+
+If you use the official GIMP AppImage, Flatpak, Snap, Windows, or macOS SDK, point your environment to the GIMP prefix so `pkg-config` can find GIMP's `.pc` files.
+
+## Build
+
+```bash
+meson setup build
+meson compile -C build
+```
+
+## Install on Linux
+
+Install the GEGL operation:
+
+```bash
+mkdir -p ~/.local/share/gegl-0.4/plug-ins
+cp build/src/gegl-palette-quantize.so ~/.local/share/gegl-0.4/plug-ins/
+```
+
+Install the GIMP plug-in:
+
+```bash
+mkdir -p ~/.config/GIMP/3.0/plug-ins/gimp-palette-quantize
+cp build/src/gimp-palette-quantize ~/.config/GIMP/3.0/plug-ins/gimp-palette-quantize/
+chmod +x ~/.config/GIMP/3.0/plug-ins/gimp-palette-quantize/gimp-palette-quantize
+```
+
+Restart GIMP.
+
+## Usage
+
+1. Select a layer or layer group in the Layers dock.
+2. Run `Filters > Color > Quantize to Palette...`.
+3. Pick a palette from the GIMP palette selector.
+4. Keep `Non-destructive layer filter` enabled to append a live filter when GIMP accepts it. Disable it to merge destructively.
+
+You can also use the GEGL operation directly through GIMP's GEGL operation dialog by choosing `custom:palette-quantize`, but that lower-level route requires entering the palette as a `#RRGGBB;#RRGGBB` string rather than choosing from GIMP's palette list.
+
+## Notes and limitations
+
+- This is nearest-color quantization with selectable distance metrics
+  (sRGB, linear, CIE Lab, OKLab). It does not yet implement dithering.
+- Non-destructive filters are available for layers; in GIMP 3.2, layer groups are layers, so selecting a group should work when the custom GEGL op is loaded.
+- If GIMP cannot append the filter non-destructively to the selected drawable, the wrapper falls back to merging the GEGL operation.
+- I could not compile-test this in the ChatGPT container because the container does not include GIMP/GEGL development headers. The code follows the GIMP 3.2.4 libgimp API docs, but you may still need small distro-specific include/link adjustments.
