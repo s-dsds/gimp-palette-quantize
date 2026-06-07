@@ -735,13 +735,13 @@ build_src (const PaletteCache *c, const gfloat *buf, gfloat *src,
       }
 }
 
-/* opaque/composite force opaque; preserve and the directional recolor modes
- * keep the original alpha so strokes keep their shape. */
+/* Only 'preserve' keeps the original alpha. Every other mode outputs a fully
+ * opaque exact palette color for visible pixels (alpha > 0); fully transparent
+ * pixels are left transparent (handled by the caller skipping a <= 0). */
 static inline gfloat
 out_alpha (gint amode, gfloat a)
 {
-  return (amode == GEGL_PQ_ALPHA_OPAQUE ||
-          amode == GEGL_PQ_ALPHA_COMPOSITE) ? 1.0f : a;
+  return (amode == GEGL_PQ_ALPHA_PRESERVE) ? a : 1.0f;
 }
 
 /* Non-diffusing modes: none (pattern 0), ordered Bayer (1), blue noise (2). */
