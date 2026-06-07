@@ -52,19 +52,28 @@ pixel can be an exact palette color:
   **Background** color using its alpha, then quantize, and output opaque. This
   makes the visible result an exact palette color even for semi-transparent
   pixels.
-- `Directional background (position)` — like composite, but the backdrop is a
-  4-color directional blend (Top/Right/Bottom/Left colors) chosen by each
-  pixel's position relative to the layer center; the **Direction** knob rotates
-  it. A directional colored fringe on semi-transparent areas.
-- `Directional emboss (edges)` — tint each shape/color edge by the Top/Right/
-  Bottom/Left color matching the local edge orientation, rotated by
-  **Direction**; **Relief** sets the depth. A pseudo-emboss: edges facing the
-  light get the light color, opposite edges the shadow color.
+The **directional** modes color or shade each *stroke* by its own shape: they
+treat the layer's alpha (blurred by **Width**) as a height field and use its
+surface normal, with four colors (**Top/Right/Bottom/Left**) and a
+**Direction** knob:
 
-In the opaque/composite/directional modes, fully transparent pixels (alpha = 0)
-are left transparent. The **Background** color is used by composite mode; the
-**Top/Right/Bottom/Left** colors, **Direction** and **Relief** drive the two
-directional modes.
+- `Directional paint (by shape)` — recolor each stroke by its surface normal:
+  the top of the stroke takes the Top color, the bottom the Bottom color, the
+  sides Left/Right. Replaces the stroke color.
+- `Directional tint (by shape)` — same, but blended over the original color
+  (**Relief** = amount), so the underlying texture shows through.
+- `Directional gradient (per stroke)` — color each *separate* stroke by its
+  position within its own bounding box (connected strokes are detected; merged
+  /overlapping strokes count as one).
+- `Bevel / emboss` — a real 3D bevel: a **Width**-wide band ramping in from the
+  edge, highlighting the side facing the light (Top color) and shadowing the
+  opposite side (Bottom color); **Relief** = strength, **Direction** = light.
+
+In the opaque/composite modes the visible pixel is forced opaque; preserve and
+the directional recolor modes keep the stroke's original alpha. Fully
+transparent pixels (alpha = 0) are always left transparent. The **Background**
+color drives composite mode; **Top/Right/Bottom/Left**, **Direction**,
+**Width** and **Relief** drive the directional/bevel modes.
 
 Matching is **exact**: every pixel is compared against all palette entries in
 the selected metric space and assigned its true nearest color, with ties

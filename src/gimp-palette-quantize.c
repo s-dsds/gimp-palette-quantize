@@ -191,10 +191,14 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                      "Quantize the pixel's own color, output fully opaque");
     gimp_choice_add (alpha, "composite", 2, "Composite over background",
                      "Blend over the background color, then quantize, output opaque");
-    gimp_choice_add (alpha, "directional-pos",  3, "Directional background (position)",
-                     "Composite over a 4-color directional gradient backdrop");
-    gimp_choice_add (alpha, "directional-edge", 4, "Directional emboss (edges)",
-                     "Tint shape/color edges by direction for a pseudo-emboss");
+    gimp_choice_add (alpha, "dir-paint", 3, "Directional paint (by shape)",
+                     "Color each stroke by its surface normal: top color on top, etc.");
+    gimp_choice_add (alpha, "dir-tint",  4, "Directional tint (by shape)",
+                     "Same as directional paint but blended over the original color");
+    gimp_choice_add (alpha, "dir-bbox",  5, "Directional gradient (per stroke)",
+                     "Color each separate stroke by position within its own bounds");
+    gimp_choice_add (alpha, "bevel",     6, "Bevel / emboss",
+                     "3D bevel: highlight the lit side, shadow the opposite, over Width");
 
     gimp_procedure_add_choice_argument (procedure,
                                         "alpha",
@@ -251,9 +255,16 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                                       G_PARAM_READWRITE);
 
   gimp_procedure_add_double_argument (procedure,
+                                      "width",
+                                      "_Width",
+                                      "Spread/bevel width in pixels (directional 'by shape' and bevel modes)",
+                                      0.0, 64.0, 4.0,
+                                      G_PARAM_READWRITE);
+
+  gimp_procedure_add_double_argument (procedure,
                                       "relief",
                                       "_Relief",
-                                      "Emboss depth for the 'directional emboss (edges)' mode",
+                                      "Strength of the directional tint / bevel shading",
                                       0.0, 1.0, 0.5,
                                       G_PARAM_READWRITE);
 
@@ -321,6 +332,7 @@ show_dialog (GimpProcedure       *procedure,
                               "color-bottom",
                               "color-left",
                               "direction",
+                              "width",
                               "relief",
                               "strength",
                               "non-destructive",
@@ -355,6 +367,7 @@ palette_quantize_run (GimpProcedure        *procedure,
   GeglColor        *color_bottom = NULL;
   GeglColor        *color_left = NULL;
   gdouble           direction = 0.0;
+  gdouble           width = 4.0;
   gdouble           relief = 0.5;
   gint              n_drawables;
 
@@ -390,6 +403,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                 "color-bottom", &color_bottom,
                 "color-left", &color_left,
                 "direction", &direction,
+                "width", &width,
                 "relief", &relief,
                 NULL);
 
@@ -450,18 +464,24 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "color-bottom", color_bottom,
                                       "color-left", color_left,
                                       "direction", direction,
+                                      "width", width,
                                       "relief", relief,
                                           "color-top", color_top,
                                           "color-right", color_right,
                                           "color-bottom", color_bottom,
                                           "color-left", color_left,
                                           "direction", direction,
+                                      "width", width,
+                                          "width", width,
                                           "relief", relief,
                                                 "color-top", color_top,
                                                 "color-right", color_right,
                                                 "color-bottom", color_bottom,
                                                 "color-left", color_left,
                                                 "direction", direction,
+                                      "width", width,
+                                          "width", width,
+                                                "width", width,
                                                 "relief", relief,
                                                 "strength", strength,
                                                 NULL);
@@ -483,12 +503,15 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "color-bottom", color_bottom,
                                       "color-left", color_left,
                                       "direction", direction,
+                                      "width", width,
                                       "relief", relief,
                                           "color-top", color_top,
                                           "color-right", color_right,
                                           "color-bottom", color_bottom,
                                           "color-left", color_left,
                                           "direction", direction,
+                                      "width", width,
+                                          "width", width,
                                           "relief", relief,
                                           "strength", strength,
                                           NULL);
@@ -512,6 +535,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "color-bottom", color_bottom,
                                       "color-left", color_left,
                                       "direction", direction,
+                                      "width", width,
                                       "relief", relief,
                                       "strength", strength,
                                       NULL);
