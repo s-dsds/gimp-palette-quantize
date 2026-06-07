@@ -32,9 +32,12 @@ The **Dithering** dropdown distributes quantization error to reduce banding:
 - `Floyd-Steinberg` — error diffusion; higher quality, but processes the whole
   layer at once (heavier for large layers / live previews).
 
-Nearest-color matching is served by a precomputed 3D lookup table built once
-per parameter change, so processing is fast and roughly independent of palette
-size.
+Matching is **exact**: every pixel is compared against all palette entries in
+the selected metric space and assigned its true nearest color, with ties
+resolved to the lowest palette index. This is what indexed-color workflows
+need — the output contains only exact palette colors, so a later
+`Image > Mode > Indexed` with the same palette produces stable indices. The
+design target is palettes of **256 colors or fewer**.
 
 ## Build & install guides
 
@@ -102,8 +105,9 @@ You can also use the GEGL operation directly through GIMP's GEGL operation dialo
 
 - Nearest-color quantization with selectable distance metrics (sRGB, linear,
   CIE Lab, OKLab) and dithering (none, ordered Bayer, Floyd-Steinberg).
-- The matching LUT is 64 levels per channel; near Voronoi-cell boundaries a
-  pixel may map to a neighboring palette color (sub-perceptual in practice).
+- Matching is exact (no lookup-table approximation). Cost is O(palette size)
+  per pixel; tuned for palettes of <= 256 colors. A full 256-color palette
+  quantizes a 4 MP layer in well under a second.
 - Floyd-Steinberg forces whole-layer processing (to avoid tile seams), so it is
   slower than the other modes for large layers and non-destructive previews.
 - Non-destructive filters are available for layers; in GIMP 3.2, layer groups are layers, so selecting a group should work when the custom GEGL op is loaded.

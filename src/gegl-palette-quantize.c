@@ -10,9 +10,16 @@
  *   - dithering:       none / ordered (Bayer 8x8) / Floyd-Steinberg
  *   - strength:        blend between original and quantized result
  *
- * Performance: nearest-color matching is served by a precomputed 3D lookup
- * table (LUT_R^3 cells) built once in prepare(), so per-pixel work is O(1)
- * instead of O(palette size). The LUT is built in the selected metric space.
+ * Matching is EXACT: each pixel is compared against every palette entry in the
+ * selected metric space and assigned its true nearest color (ties resolved to
+ * the lowest palette index). This is what indexed-color workflows need — the
+ * result contains only exact palette colors, so a later "Image > Mode >
+ * Indexed" with the same palette assigns stable indices. The design target is
+ * palettes of <= 256 colors, so the per-pixel O(n) scan is cheap.
+ *
+ * To keep matching exact without per-pixel color conversion, pixels are
+ * batch-converted into the metric space once per tile (and the whole image,
+ * once, for Floyd-Steinberg, whose error is also diffused in the metric space).
  *
  * This operation is deliberately GIMP-independent. The companion GIMP plug-in
  * converts a selected GimpPalette into this inline string and appends/merges
@@ -73,10 +80,6 @@ property_double (strength, "Strength", 1.0)
 
 #include "gegl-op.h"
 
-/* LUT resolution per channel. 64 -> 64^3 = 262144 cells, 512 KB of guint16.
- * Boundary error is < 1/64 per channel, sub-perceptual for quantization. */
-#define LUT_R 64
-
 typedef struct
 {
   gfloat r;
@@ -84,16 +87,17 @@ typedef struct
   gfloat b;
 } PaletteColor;
 
-/* Parsed-and-prepared palette + matching LUT, cached on the operation. Built
- * once in prepare() (single-threaded); process() only reads it. */
+/* Parsed-and-prepared palette, cached on the operation. Built once in
+ * prepare() (single-threaded); process() only reads it. */
 typedef struct
 {
-  gchar    *palette;   /* copy of the source string, for change detection  */
-  gint      metric;    /* metric the LUT was built for                     */
-  guint     n;         /* number of palette colors                         */
-  gfloat   *srgb;      /* n * 3, sRGB 0..1 — written to the output         */
-  guint16  *lut;       /* LUT_R^3, palette index per quantized sRGB cell   */
-  gfloat    amp;       /* ordered-dither amplitude (mean palette spacing)  */
+  gchar      *palette;   /* copy of the source string, for change detection  */
+  gint        metric;    /* metric the coords were built for                 */
+  guint       n;         /* number of palette colors                         */
+  gfloat     *srgb;      /* n * 3, sRGB 0..1 — written to the output         */
+  gfloat     *coord;     /* n * 3, palette colors in the metric space        */
+  const Babl *to_coord;  /* fish: "R'G'B'A float" -> metric space (3 ch)     */
+  gfloat      amp;       /* ordered-dither amplitude (mean palette spacing)  */
 } PaletteCache;
 
 static const gint bayer8[8][8] = {
@@ -196,7 +200,7 @@ palette_cache_free (PaletteCache *c)
     return;
   g_free (c->palette);
   g_free (c->srgb);
-  g_free (c->lut);
+  g_free (c->coord);
   g_free (c);
 }
 
@@ -209,15 +213,17 @@ sqdist3 (const gfloat *a, const gfloat *b)
   return d0 * d0 + d1 * d1 + d2 * d2;
 }
 
-static guint
-nearest_in (const gfloat *p, const gfloat *coord, guint n)
+/* Exact nearest palette color in the metric space. Ties resolve to the lowest
+ * index (strict '<'), giving deterministic, index-stable results. */
+static inline guint
+nearest_exact (const gfloat *p, const PaletteCache *c)
 {
   guint  best   = 0;
   gfloat best_d = G_MAXFLOAT;
 
-  for (guint i = 0; i < n; i++)
+  for (guint i = 0; i < c->n; i++)
     {
-      gfloat d = sqdist3 (p, coord + i * 3);
+      gfloat d = sqdist3 (p, c->coord + i * 3);
       if (d < best_d)
         {
           best_d = d;
@@ -234,16 +240,13 @@ palette_cache_build (const gchar *palette_str, gint metric)
   guint         n      = colors->len;
   PaletteCache *c      = g_new0 (PaletteCache, 1);
   const Babl   *fmt    = babl_format (metric_format (metric));
-  const Babl   *to_m   = babl_fish (babl_format ("R'G'B' float"), fmt);
-  gfloat       *coord;        /* palette colors in metric space            */
-  gfloat       *centers;      /* LUT cell centers, sRGB                     */
-  gfloat       *centers_m;    /* LUT cell centers, metric space            */
-  gsize         cells   = (gsize) LUT_R * LUT_R * LUT_R;
 
-  c->palette = g_strdup (palette_str ? palette_str : "");
-  c->metric  = metric;
-  c->n       = n;
-  c->srgb    = g_new (gfloat, (gsize) n * 3);
+  c->palette  = g_strdup (palette_str ? palette_str : "");
+  c->metric   = metric;
+  c->n        = n;
+  c->srgb     = g_new (gfloat, (gsize) n * 3);
+  c->coord    = g_new (gfloat, (gsize) n * 3);
+  c->to_coord = babl_fish (babl_format ("R'G'B'A float"), fmt);
 
   for (guint i = 0; i < n; i++)
     {
@@ -253,11 +256,12 @@ palette_cache_build (const gchar *palette_str, gint metric)
       c->srgb[i * 3 + 2] = pc.b;
     }
 
-  coord = g_new (gfloat, (gsize) n * 3);
-  babl_process (to_m, c->srgb, coord, n);
+  /* Palette in the metric space (used for both matching and dithering). */
+  babl_process (babl_fish (babl_format ("R'G'B' float"), fmt),
+                c->srgb, c->coord, n);
 
-  /* Ordered-dither amplitude: mean distance (in sRGB) from each palette color
-   * to its nearest neighbor — a reasonable "quantization step". */
+  /* Ordered-dither amplitude: mean distance (in the metric space) from each
+   * palette color to its nearest neighbor — a reasonable quantization step. */
   c->amp = 0.0f;
   if (n > 1)
     {
@@ -268,7 +272,7 @@ palette_cache_build (const gchar *palette_str, gint metric)
           for (guint j = 0; j < n; j++)
             if (j != i)
               {
-                gfloat d = sqdist3 (c->srgb + i * 3, c->srgb + j * 3);
+                gfloat d = sqdist3 (c->coord + i * 3, c->coord + j * 3);
                 if (d < best) best = d;
               }
           acc += sqrtf (best);
@@ -276,47 +280,8 @@ palette_cache_build (const gchar *palette_str, gint metric)
       c->amp = acc / n;
     }
 
-  /* Build the nearest-color LUT in the metric space. */
-  c->lut    = g_new (guint16, cells);
-  centers   = g_new (gfloat, cells * 3);
-  centers_m = g_new (gfloat, cells * 3);
-
-  {
-    gsize idx = 0;
-    for (gint ir = 0; ir < LUT_R; ir++)
-      for (gint ig = 0; ig < LUT_R; ig++)
-        for (gint ib = 0; ib < LUT_R; ib++, idx++)
-          {
-            centers[idx * 3 + 0] = (ir + 0.5f) / LUT_R;
-            centers[idx * 3 + 1] = (ig + 0.5f) / LUT_R;
-            centers[idx * 3 + 2] = (ib + 0.5f) / LUT_R;
-          }
-  }
-
-  babl_process (to_m, centers, centers_m, cells);
-
-  for (gsize i = 0; i < cells; i++)
-    c->lut[i] = (guint16) nearest_in (centers_m + i * 3, coord, n);
-
-  g_free (centers);
-  g_free (centers_m);
-  g_free (coord);
   g_array_unref (colors);
   return c;
-}
-
-static inline guint
-lut_lookup (const PaletteCache *c, gfloat r, gfloat g, gfloat b)
-{
-  gint ir = (gint) (CLAMP (r, 0.0f, 1.0f) * LUT_R);
-  gint ig = (gint) (CLAMP (g, 0.0f, 1.0f) * LUT_R);
-  gint ib = (gint) (CLAMP (b, 0.0f, 1.0f) * LUT_R);
-
-  if (ir >= LUT_R) ir = LUT_R - 1;
-  if (ig >= LUT_R) ig = LUT_R - 1;
-  if (ib >= LUT_R) ib = LUT_R - 1;
-
-  return c->lut[((gsize) ir * LUT_R + ig) * LUT_R + ib];
 }
 
 /* -------- per-mode processing over an interleaved R'G'B'A float buffer ----- */
@@ -325,96 +290,100 @@ static void
 process_simple (const PaletteCache *c, gfloat *buf, glong w, glong h,
                 glong ox, glong oy, gfloat strength, gboolean ordered)
 {
-  for (glong y = 0; y < h; y++)
-    for (glong x = 0; x < w; x++)
-      {
-        gfloat *px = buf + ((gsize) y * w + x) * 4;
-        gfloat  a  = px[3];
-        gfloat  mr, mg, mb;
-        guint   idx;
+  gfloat *cm = g_new (gfloat, (gsize) w * h * 3);   /* pixels in metric space */
 
-        if (a <= 0.0f)
-          continue;
-
-        mr = px[0]; mg = px[1]; mb = px[2];
-
-        if (ordered)
-          {
-            gint  bx  = (gint) ((ox + x) & 7);
-            gint  by  = (gint) ((oy + y) & 7);
-            gfloat off = (((bayer8[by][bx] + 0.5f) / 64.0f) - 0.5f) * c->amp;
-            mr += off; mg += off; mb += off;
-          }
-
-        idx = lut_lookup (c, mr, mg, mb);
-
-        px[0] = px[0] + (c->srgb[idx * 3 + 0] - px[0]) * strength;
-        px[1] = px[1] + (c->srgb[idx * 3 + 1] - px[1]) * strength;
-        px[2] = px[2] + (c->srgb[idx * 3 + 2] - px[2]) * strength;
-      }
-}
-
-static void
-process_floyd_steinberg (const PaletteCache *c, gfloat *buf, glong w, glong h,
-                         gfloat strength)
-{
-  gfloat *work = g_new (gfloat, (gsize) w * h * 3);
-
-  for (gsize i = 0; i < (gsize) w * h; i++)
-    {
-      work[i * 3 + 0] = buf[i * 4 + 0];
-      work[i * 3 + 1] = buf[i * 4 + 1];
-      work[i * 3 + 2] = buf[i * 4 + 2];
-    }
+  babl_process (c->to_coord, buf, cm, (glong) w * h);
 
   for (glong y = 0; y < h; y++)
     for (glong x = 0; x < w; x++)
       {
         gsize   p  = (gsize) y * w + x;
         gfloat *px = buf + p * 4;
-        gfloat *wk = work + p * 3;
         gfloat  a  = px[3];
+        const gfloat *m = cm + p * 3;
+        gfloat  mm[3];
         guint   idx;
-        gfloat  er, eg, eb;
+
+        if (a <= 0.0f)
+          continue;
+
+        if (ordered)
+          {
+            gint   bx  = (gint) ((ox + x) & 7);
+            gint   by  = (gint) ((oy + y) & 7);
+            gfloat off = (((bayer8[by][bx] + 0.5f) / 64.0f) - 0.5f) * c->amp;
+            mm[0] = m[0] + off; mm[1] = m[1] + off; mm[2] = m[2] + off;
+            idx = nearest_exact (mm, c);
+          }
+        else
+          {
+            idx = nearest_exact (m, c);
+          }
+
+        px[0] = px[0] + (c->srgb[idx * 3 + 0] - px[0]) * strength;
+        px[1] = px[1] + (c->srgb[idx * 3 + 1] - px[1]) * strength;
+        px[2] = px[2] + (c->srgb[idx * 3 + 2] - px[2]) * strength;
+      }
+
+  g_free (cm);
+}
+
+static void
+process_floyd_steinberg (const PaletteCache *c, gfloat *buf, glong w, glong h,
+                         gfloat strength)
+{
+  gfloat *wm = g_new (gfloat, (gsize) w * h * 3);  /* working metric values */
+
+  babl_process (c->to_coord, buf, wm, (glong) w * h);
+
+  for (glong y = 0; y < h; y++)
+    for (glong x = 0; x < w; x++)
+      {
+        gsize   p   = (gsize) y * w + x;
+        gfloat *px  = buf + p * 4;
+        gfloat *m   = wm + p * 3;
+        gfloat  a   = px[3];
+        guint   idx;
+        gfloat  e0, e1, e2;
 
         if (a <= 0.0f)
           continue;  /* leave transparent pixels untouched, no diffusion */
 
-        idx = lut_lookup (c, wk[0], wk[1], wk[2]);
+        idx = nearest_exact (m, c);
 
-        er = wk[0] - c->srgb[idx * 3 + 0];
-        eg = wk[1] - c->srgb[idx * 3 + 1];
-        eb = wk[2] - c->srgb[idx * 3 + 2];
+        e0 = m[0] - c->coord[idx * 3 + 0];
+        e1 = m[1] - c->coord[idx * 3 + 1];
+        e2 = m[2] - c->coord[idx * 3 + 2];
 
-        /* Floyd-Steinberg distribution: 7/16, 3/16, 5/16, 1/16. */
+        /* Floyd-Steinberg distribution (in metric space): 7/16,3/16,5/16,1/16 */
         if (x + 1 < w)
           {
-            gfloat *n = work + (p + 1) * 3;
-            n[0] += er * (7.0f / 16.0f);
-            n[1] += eg * (7.0f / 16.0f);
-            n[2] += eb * (7.0f / 16.0f);
+            gfloat *nb = wm + (p + 1) * 3;
+            nb[0] += e0 * (7.0f / 16.0f);
+            nb[1] += e1 * (7.0f / 16.0f);
+            nb[2] += e2 * (7.0f / 16.0f);
           }
         if (y + 1 < h)
           {
             if (x > 0)
               {
-                gfloat *n = work + (p + w - 1) * 3;
-                n[0] += er * (3.0f / 16.0f);
-                n[1] += eg * (3.0f / 16.0f);
-                n[2] += eb * (3.0f / 16.0f);
+                gfloat *nb = wm + (p + w - 1) * 3;
+                nb[0] += e0 * (3.0f / 16.0f);
+                nb[1] += e1 * (3.0f / 16.0f);
+                nb[2] += e2 * (3.0f / 16.0f);
               }
             {
-              gfloat *n = work + (p + w) * 3;
-              n[0] += er * (5.0f / 16.0f);
-              n[1] += eg * (5.0f / 16.0f);
-              n[2] += eb * (5.0f / 16.0f);
+              gfloat *nb = wm + (p + w) * 3;
+              nb[0] += e0 * (5.0f / 16.0f);
+              nb[1] += e1 * (5.0f / 16.0f);
+              nb[2] += e2 * (5.0f / 16.0f);
             }
             if (x + 1 < w)
               {
-                gfloat *n = work + (p + w + 1) * 3;
-                n[0] += er * (1.0f / 16.0f);
-                n[1] += eg * (1.0f / 16.0f);
-                n[2] += eb * (1.0f / 16.0f);
+                gfloat *nb = wm + (p + w + 1) * 3;
+                nb[0] += e0 * (1.0f / 16.0f);
+                nb[1] += e1 * (1.0f / 16.0f);
+                nb[2] += e2 * (1.0f / 16.0f);
               }
           }
 
@@ -423,7 +392,7 @@ process_floyd_steinberg (const PaletteCache *c, gfloat *buf, glong w, glong h,
         px[2] = px[2] + (c->srgb[idx * 3 + 2] - px[2]) * strength;
       }
 
-  g_free (work);
+  g_free (wm);
 }
 
 static gboolean
@@ -516,8 +485,8 @@ prepare (GeglOperation *operation)
   gegl_operation_set_format (operation, "input", format);
   gegl_operation_set_format (operation, "output", format);
 
-  /* (Re)build the palette cache + LUT whenever the inputs change. prepare()
-   * is single-threaded, so this is the safe place to touch user_data. */
+  /* (Re)build the palette cache whenever the inputs change. prepare() is
+   * single-threaded, so this is the safe place to touch user_data. */
   palette_cache_free (o->user_data);
   o->user_data = palette_cache_build (o->palette, o->metric);
 }
