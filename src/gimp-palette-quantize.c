@@ -162,6 +162,44 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                                         G_PARAM_READWRITE);
   }
 
+  /* Alpha handling. Nicks MUST match the GEGL op's GeglPaletteQuantizeAlpha
+   * enum nicks. Default "composite" so the visible color is an exact palette
+   * color (semi-transparent pixels are blended over the background first). */
+  {
+    GimpChoice *alpha = gimp_choice_new ();
+
+    gimp_choice_add (alpha, "preserve",  0, "Preserve alpha",
+                     "Quantize color, keep the original alpha");
+    gimp_choice_add (alpha, "opaque",    1, "Opaque (ignore alpha)",
+                     "Quantize the pixel's own color, output fully opaque");
+    gimp_choice_add (alpha, "composite", 2, "Composite over background",
+                     "Blend over the background color, then quantize, output opaque");
+
+    gimp_procedure_add_choice_argument (procedure,
+                                        "alpha",
+                                        "_Alpha",
+                                        "How to treat alpha so the visible color is an exact palette color",
+                                        alpha,
+                                        "composite",
+                                        G_PARAM_READWRITE);
+  }
+
+  /* Background color for the "composite over background" alpha mode. */
+  {
+    GeglColor *white;
+
+    gegl_init (NULL, NULL);   /* needed before gegl_color_new(); idempotent */
+    white = gegl_color_new ("white");
+
+    gimp_procedure_add_color_argument (procedure,
+                                       "background",
+                                       "_Background",
+                                       "Backdrop color used by the 'composite over background' alpha mode",
+                                       FALSE,
+                                       white,
+                                       G_PARAM_READWRITE);
+  }
+
   return procedure;
 }
 
@@ -218,6 +256,8 @@ show_dialog (GimpProcedure       *procedure,
                               "palette",
                               "metric",
                               "dither",
+                              "alpha",
+                              "background",
                               "strength",
                               "non-destructive",
                               NULL);
@@ -243,6 +283,8 @@ palette_quantize_run (GimpProcedure        *procedure,
   gboolean          non_destructive = TRUE;
   gchar            *metric = NULL;
   gchar            *dither = NULL;
+  gchar            *alpha = NULL;
+  GeglColor        *background = NULL;
   gint              n_drawables;
 
   (void) run_data;
@@ -269,16 +311,23 @@ palette_quantize_run (GimpProcedure        *procedure,
                 "non-destructive", &non_destructive,
                 "metric", &metric,
                 "dither", &dither,
+                "alpha", &alpha,
+                "background", &background,
                 NULL);
 
   /* GIMP mirrors the GEGL op's enum properties into the drawable-filter config
    * as nick strings, so they must be passed to *_new_filter() as const gchar*
    * (passing an integer id would be read as a bogus pointer and crash). Our
-   * GimpChoice nicks intentionally match the GEGL enum nicks. */
+   * GimpChoice nicks intentionally match the GEGL enum nicks. The background
+   * is a GeglColor on both sides and is passed straight through. */
   if (! metric)
     metric = g_strdup ("srgb");
   if (! dither)
     dither = g_strdup ("none");
+  if (! alpha)
+    alpha = g_strdup ("composite");
+  if (! background)
+    background = gegl_color_new ("white");
 
   strength = CLAMP (strength, 0.0, 1.0);
   hex_palette = palette_to_hex_string (palette, &error);
@@ -288,6 +337,8 @@ palette_quantize_run (GimpProcedure        *procedure,
     {
       g_free (metric);
       g_free (dither);
+      g_free (alpha);
+      g_clear_object (&background);
       return gimp_procedure_new_return_values (procedure, GIMP_PDB_CALLING_ERROR, error);
     }
 
@@ -305,6 +356,8 @@ palette_quantize_run (GimpProcedure        *procedure,
                                                 "palette", hex_palette,
                                                 "metric", metric,
                                                 "dither", dither,
+                                                "alpha", alpha,
+                                                "background", background,
                                                 "strength", strength,
                                                 NULL);
       if (! filter)
@@ -317,6 +370,8 @@ palette_quantize_run (GimpProcedure        *procedure,
                                           "palette", hex_palette,
                                           "metric", metric,
                                           "dither", dither,
+                                          "alpha", alpha,
+                                          "background", background,
                                           "strength", strength,
                                           NULL);
         }
@@ -331,6 +386,8 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "palette", hex_palette,
                                       "metric", metric,
                                       "dither", dither,
+                                      "alpha", alpha,
+                                      "background", background,
                                       "strength", strength,
                                       NULL);
     }
@@ -341,6 +398,8 @@ palette_quantize_run (GimpProcedure        *procedure,
   g_free (hex_palette);
   g_free (metric);
   g_free (dither);
+  g_free (alpha);
+  g_clear_object (&background);
 
   return gimp_procedure_new_return_values (procedure, status, NULL);
 }

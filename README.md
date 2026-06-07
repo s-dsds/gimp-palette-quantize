@@ -32,6 +32,20 @@ The **Dithering** dropdown distributes quantization error to reduce banding:
 - `Floyd-Steinberg` — error diffusion; higher quality, but processes the whole
   layer at once (heavier for large layers / live previews).
 
+The **Alpha** dropdown controls how transparency is handled so the *visible*
+pixel can be an exact palette color:
+
+- `Preserve alpha` — quantize the color, keep each pixel's original alpha.
+- `Opaque (ignore alpha)` — quantize the pixel's own color and output it fully
+  opaque, ignoring its alpha and whatever is below.
+- `Composite over background` (default) — blend each pixel over the
+  **Background** color using its alpha, then quantize, and output opaque. This
+  makes the visible result an exact palette color even for semi-transparent
+  pixels.
+
+In the opaque/composite modes, fully transparent pixels (alpha = 0) are left
+transparent. The **Background** color is only used by the composite mode.
+
 Matching is **exact**: every pixel is compared against all palette entries in
 the selected metric space and assigned its true nearest color, with ties
 resolved to the lowest palette index. This is what indexed-color workflows
@@ -96,8 +110,11 @@ Restart GIMP.
 2. Run `Filters > Color > Quantize to Palette...`.
 3. Pick a palette from the GIMP palette selector.
 4. Choose a `Metric` (how nearest color is measured) and a `Dithering` method.
-5. Adjust `Strength` to blend the result with the original.
-6. Keep `Non-destructive layer filter` enabled to append a live filter when GIMP accepts it. Disable it to merge destructively.
+5. Choose an `Alpha` mode. For an exact, fully opaque visible color, use
+   `Opaque` or `Composite over background` (and pick a `Background` color for
+   the latter).
+6. Adjust `Strength` to blend the result with the original.
+7. Keep `Non-destructive layer filter` enabled to append a live filter when GIMP accepts it. Disable it to merge destructively.
 
 You can also use the GEGL operation directly through GIMP's GEGL operation dialog by choosing `custom:palette-quantize`, but that lower-level route requires entering the palette as a `#RRGGBB;#RRGGBB` string rather than choosing from GIMP's palette list.
 

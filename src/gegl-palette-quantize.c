@@ -8,6 +8,7 @@
  * Features:
  *   - distance metric: sRGB / linear RGB / CIE Lab / OKLab
  *   - dithering:       none / ordered (Bayer 8x8) / Floyd-Steinberg
+ *   - alpha handling:  preserve / opaque / composite over a background color
  *   - strength:        blend between original and quantized result
  *
  * Matching is EXACT: each pixel is compared against every palette entry in the
@@ -17,9 +18,15 @@
  * Indexed" with the same palette assigns stable indices. The design target is
  * palettes of <= 256 colors, so the per-pixel O(n) scan is cheap.
  *
- * To keep matching exact without per-pixel color conversion, pixels are
- * batch-converted into the metric space once per tile (and the whole image,
- * once, for Floyd-Steinberg, whose error is also diffused in the metric space).
+ * Alpha handling controls what the *visible* pixel becomes:
+ *   - preserve:  quantize the straight RGB, keep the original alpha.
+ *   - opaque:    quantize the straight RGB, force the output fully opaque
+ *                (ignores both the alpha and whatever is below).
+ *   - composite: blend the pixel over the background color using its alpha,
+ *                then quantize, and force the output opaque — so the visible
+ *                color is an exact palette color.
+ * In the opaque/composite modes, fully transparent pixels (alpha == 0) are
+ * left transparent.
  *
  * This operation is deliberately GIMP-independent. The companion GIMP plug-in
  * converts a selected GimpPalette into this inline string and appends/merges
@@ -48,6 +55,12 @@ enum_start (gegl_palette_quantize_dither)
   enum_value (GEGL_PQ_DITHER_FS,      "floyd-steinberg", "Floyd-Steinberg")
 enum_end (GeglPaletteQuantizeDither)
 
+enum_start (gegl_palette_quantize_alpha)
+  enum_value (GEGL_PQ_ALPHA_PRESERVE,  "preserve",  "Preserve alpha")
+  enum_value (GEGL_PQ_ALPHA_OPAQUE,    "opaque",    "Opaque (ignore alpha)")
+  enum_value (GEGL_PQ_ALPHA_COMPOSITE, "composite", "Composite over background")
+enum_end (GeglPaletteQuantizeAlpha)
+
 property_string (palette, "Palette", "#000000;#ffffff")
   description ("Palette colors as separated #RRGGBB values")
 
@@ -60,6 +73,14 @@ property_enum (dither, "Dithering",
                GeglPaletteQuantizeDither, gegl_palette_quantize_dither,
                GEGL_PQ_DITHER_NONE)
   description ("Dithering method used to distribute quantization error")
+
+property_enum (alpha, "Alpha",
+               GeglPaletteQuantizeAlpha, gegl_palette_quantize_alpha,
+               GEGL_PQ_ALPHA_COMPOSITE)
+  description ("How to treat alpha so the visible color is an exact palette color")
+
+property_color (background, "Background", "white")
+  description ("Backdrop color used by the 'composite over background' alpha mode")
 
 property_double (strength, "Strength", 1.0)
   value_range (0.0, 1.0)
@@ -96,8 +117,9 @@ typedef struct
   guint       n;         /* number of palette colors                         */
   gfloat     *srgb;      /* n * 3, sRGB 0..1 — written to the output         */
   gfloat     *coord;     /* n * 3, palette colors in the metric space        */
-  const Babl *to_coord;  /* fish: "R'G'B'A float" -> metric space (3 ch)     */
+  const Babl *from_rgb;  /* fish: "R'G'B' float" -> metric space (3 ch)      */
   gfloat      amp;       /* ordered-dither amplitude (mean palette spacing)  */
+  gfloat      bg[3];     /* background color (sRGB), for composite mode      */
 } PaletteCache;
 
 static const gint bayer8[8][8] = {
@@ -246,7 +268,8 @@ palette_cache_build (const gchar *palette_str, gint metric)
   c->n        = n;
   c->srgb     = g_new (gfloat, (gsize) n * 3);
   c->coord    = g_new (gfloat, (gsize) n * 3);
-  c->to_coord = babl_fish (babl_format ("R'G'B'A float"), fmt);
+  c->from_rgb = babl_fish (babl_format ("R'G'B' float"), fmt);
+  c->bg[0] = c->bg[1] = c->bg[2] = 1.0f;   /* default white; set in prepare */
 
   for (guint i = 0; i < n; i++)
     {
@@ -257,8 +280,7 @@ palette_cache_build (const gchar *palette_str, gint metric)
     }
 
   /* Palette in the metric space (used for both matching and dithering). */
-  babl_process (babl_fish (babl_format ("R'G'B' float"), fmt),
-                c->srgb, c->coord, n);
+  babl_process (c->from_rgb, c->srgb, c->coord, n);
 
   /* Ordered-dither amplitude: mean distance (in the metric space) from each
    * palette color to its nearest neighbor — a reasonable quantization step. */
@@ -286,26 +308,63 @@ palette_cache_build (const gchar *palette_str, gint metric)
 
 /* -------- per-mode processing over an interleaved R'G'B'A float buffer ----- */
 
+/* Build the straight-RGB color that will be matched and used as the blend
+ * source, per alpha mode. For 'composite', blend over the background color. */
+static void
+build_src (const PaletteCache *c, const gfloat *buf, gfloat *src,
+           glong npix, gint amode)
+{
+  for (glong i = 0; i < npix; i++)
+    {
+      gfloat a = buf[i * 4 + 3];
+
+      if (amode == GEGL_PQ_ALPHA_COMPOSITE && a < 1.0f)
+        {
+          gfloat ia = 1.0f - a;
+          src[i * 3 + 0] = buf[i * 4 + 0] * a + c->bg[0] * ia;
+          src[i * 3 + 1] = buf[i * 4 + 1] * a + c->bg[1] * ia;
+          src[i * 3 + 2] = buf[i * 4 + 2] * a + c->bg[2] * ia;
+        }
+      else
+        {
+          src[i * 3 + 0] = buf[i * 4 + 0];
+          src[i * 3 + 1] = buf[i * 4 + 1];
+          src[i * 3 + 2] = buf[i * 4 + 2];
+        }
+    }
+}
+
+static inline gfloat
+out_alpha (gint amode, gfloat a)
+{
+  return (amode == GEGL_PQ_ALPHA_PRESERVE) ? a : 1.0f;
+}
+
 static void
 process_simple (const PaletteCache *c, gfloat *buf, glong w, glong h,
-                glong ox, glong oy, gfloat strength, gboolean ordered)
+                glong ox, glong oy, gfloat strength, gboolean ordered, gint amode)
 {
-  gfloat *cm = g_new (gfloat, (gsize) w * h * 3);   /* pixels in metric space */
+  glong   npix = w * h;
+  gfloat *src  = g_new (gfloat, (gsize) npix * 3);   /* match & blend source  */
+  gfloat *cm   = g_new (gfloat, (gsize) npix * 3);   /* src in metric space   */
 
-  babl_process (c->to_coord, buf, cm, (glong) w * h);
+  build_src (c, buf, src, npix, amode);
+  babl_process (c->from_rgb, src, cm, npix);
 
   for (glong y = 0; y < h; y++)
     for (glong x = 0; x < w; x++)
       {
-        gsize   p  = (gsize) y * w + x;
-        gfloat *px = buf + p * 4;
-        gfloat  a  = px[3];
-        const gfloat *m = cm + p * 3;
-        gfloat  mm[3];
-        guint   idx;
+        gsize         p  = (gsize) y * w + x;
+        gfloat       *px = buf + p * 4;
+        const gfloat *s  = src + p * 3;
+        const gfloat *m  = cm + p * 3;
+        gfloat        a  = px[3];
+        gfloat        mm[3];
+        const gfloat *q;
+        guint         idx;
 
         if (a <= 0.0f)
-          continue;
+          continue;  /* fully transparent stays transparent */
 
         if (ordered)
           {
@@ -320,31 +379,39 @@ process_simple (const PaletteCache *c, gfloat *buf, glong w, glong h,
             idx = nearest_exact (m, c);
           }
 
-        px[0] = px[0] + (c->srgb[idx * 3 + 0] - px[0]) * strength;
-        px[1] = px[1] + (c->srgb[idx * 3 + 1] - px[1]) * strength;
-        px[2] = px[2] + (c->srgb[idx * 3 + 2] - px[2]) * strength;
+        q = c->srgb + idx * 3;
+        px[0] = s[0] + (q[0] - s[0]) * strength;
+        px[1] = s[1] + (q[1] - s[1]) * strength;
+        px[2] = s[2] + (q[2] - s[2]) * strength;
+        px[3] = out_alpha (amode, a);
       }
 
+  g_free (src);
   g_free (cm);
 }
 
 static void
 process_floyd_steinberg (const PaletteCache *c, gfloat *buf, glong w, glong h,
-                         gfloat strength)
+                         gfloat strength, gint amode)
 {
-  gfloat *wm = g_new (gfloat, (gsize) w * h * 3);  /* working metric values */
+  glong   npix = w * h;
+  gfloat *src  = g_new (gfloat, (gsize) npix * 3);   /* blend source          */
+  gfloat *wm   = g_new (gfloat, (gsize) npix * 3);   /* working metric values */
 
-  babl_process (c->to_coord, buf, wm, (glong) w * h);
+  build_src (c, buf, src, npix, amode);
+  babl_process (c->from_rgb, src, wm, npix);
 
   for (glong y = 0; y < h; y++)
     for (glong x = 0; x < w; x++)
       {
-        gsize   p   = (gsize) y * w + x;
-        gfloat *px  = buf + p * 4;
-        gfloat *m   = wm + p * 3;
-        gfloat  a   = px[3];
-        guint   idx;
-        gfloat  e0, e1, e2;
+        gsize         p   = (gsize) y * w + x;
+        gfloat       *px  = buf + p * 4;
+        const gfloat *s   = src + p * 3;
+        gfloat       *m   = wm + p * 3;
+        gfloat        a   = px[3];
+        const gfloat *q;
+        guint         idx;
+        gfloat        e0, e1, e2;
 
         if (a <= 0.0f)
           continue;  /* leave transparent pixels untouched, no diffusion */
@@ -387,11 +454,14 @@ process_floyd_steinberg (const PaletteCache *c, gfloat *buf, glong w, glong h,
               }
           }
 
-        px[0] = px[0] + (c->srgb[idx * 3 + 0] - px[0]) * strength;
-        px[1] = px[1] + (c->srgb[idx * 3 + 1] - px[1]) * strength;
-        px[2] = px[2] + (c->srgb[idx * 3 + 2] - px[2]) * strength;
+        q = c->srgb + idx * 3;
+        px[0] = s[0] + (q[0] - s[0]) * strength;
+        px[1] = s[1] + (q[1] - s[1]) * strength;
+        px[2] = s[2] + (q[2] - s[2]) * strength;
+        px[3] = out_alpha (amode, a);
       }
 
+  g_free (src);
   g_free (wm);
 }
 
@@ -407,6 +477,7 @@ process (GeglOperation       *operation,
   const Babl         *format = babl_format ("R'G'B'A float");
   gfloat             *buf;
   gfloat              strength;
+  gint                amode;
 
   (void) level;
 
@@ -414,6 +485,7 @@ process (GeglOperation       *operation,
     return TRUE;
 
   strength = CLAMP ((gfloat) o->strength, 0.0f, 1.0f);
+  amode    = o->alpha;
 
   buf = g_new (gfloat, (gsize) roi->width * roi->height * 4);
   gegl_buffer_get (input, roi, 1.0, format, buf,
@@ -422,16 +494,16 @@ process (GeglOperation       *operation,
   switch (o->dither)
     {
     case GEGL_PQ_DITHER_FS:
-      process_floyd_steinberg (c, buf, roi->width, roi->height, strength);
+      process_floyd_steinberg (c, buf, roi->width, roi->height, strength, amode);
       break;
     case GEGL_PQ_DITHER_ORDERED:
       process_simple (c, buf, roi->width, roi->height,
-                      roi->x, roi->y, strength, TRUE);
+                      roi->x, roi->y, strength, TRUE, amode);
       break;
     case GEGL_PQ_DITHER_NONE:
     default:
       process_simple (c, buf, roi->width, roi->height,
-                      roi->x, roi->y, strength, FALSE);
+                      roi->x, roi->y, strength, FALSE, amode);
       break;
     }
 
@@ -481,6 +553,7 @@ prepare (GeglOperation *operation)
 {
   GeglProperties *o      = GEGL_PROPERTIES (operation);
   const Babl     *format = babl_format ("R'G'B'A float");
+  PaletteCache   *c;
 
   gegl_operation_set_format (operation, "input", format);
   gegl_operation_set_format (operation, "output", format);
@@ -488,7 +561,12 @@ prepare (GeglOperation *operation)
   /* (Re)build the palette cache whenever the inputs change. prepare() is
    * single-threaded, so this is the safe place to touch user_data. */
   palette_cache_free (o->user_data);
-  o->user_data = palette_cache_build (o->palette, o->metric);
+  c = palette_cache_build (o->palette, o->metric);
+
+  if (o->background)
+    gegl_color_get_pixel (o->background, babl_format ("R'G'B' float"), c->bg);
+
+  o->user_data = c;
 }
 
 static void
@@ -523,7 +601,7 @@ gegl_op_class_init (GeglOpClass *klass)
                                  "name",        "custom:palette-quantize",
                                  "title",       "Palette Quantize",
                                  "categories",  "color:palette",
-                                 "description", "Map every pixel to the nearest color in a supplied palette, with optional dithering.",
+                                 "description", "Map every pixel to the nearest color in a supplied palette, with optional dithering and alpha handling.",
                                  NULL);
 }
 
