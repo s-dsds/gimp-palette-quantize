@@ -52,9 +52,19 @@ pixel can be an exact palette color:
   **Background** color using its alpha, then quantize, and output opaque. This
   makes the visible result an exact palette color even for semi-transparent
   pixels.
+- `Directional background (position)` — like composite, but the backdrop is a
+  4-color directional blend (Top/Right/Bottom/Left colors) chosen by each
+  pixel's position relative to the layer center; the **Direction** knob rotates
+  it. A directional colored fringe on semi-transparent areas.
+- `Directional emboss (edges)` — tint each shape/color edge by the Top/Right/
+  Bottom/Left color matching the local edge orientation, rotated by
+  **Direction**; **Relief** sets the depth. A pseudo-emboss: edges facing the
+  light get the light color, opposite edges the shadow color.
 
-In the opaque/composite modes, fully transparent pixels (alpha = 0) are left
-transparent. The **Background** color is only used by the composite mode.
+In the opaque/composite/directional modes, fully transparent pixels (alpha = 0)
+are left transparent. The **Background** color is used by composite mode; the
+**Top/Right/Bottom/Left** colors, **Direction** and **Relief** drive the two
+directional modes.
 
 Matching is **exact**: every pixel is compared against all palette entries in
 the selected metric space and assigned its true nearest color, with ties

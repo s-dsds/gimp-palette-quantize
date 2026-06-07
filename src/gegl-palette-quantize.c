@@ -9,7 +9,10 @@
  *   - distance metric: sRGB / linear RGB / CIE Lab / OKLab
  *   - dithering:       none / ordered (Bayer) / blue noise / Floyd-Steinberg /
  *                      Atkinson / Jarvis / Stucki / Sierra (+ serpentine)
- *   - alpha handling:  preserve / opaque / composite over a background color
+ *   - alpha handling:  preserve / opaque / composite over a background color /
+ *                      directional background (position) / directional emboss
+ *                      (edges), the last two using 4 directional colors +
+ *                      a direction knob (+ relief for the emboss)
  *   - strength:        blend between original and quantized result
  *
  * Matching is EXACT: each pixel is compared against every palette entry in the
@@ -62,9 +65,11 @@ enum_start (gegl_palette_quantize_dither)
 enum_end (GeglPaletteQuantizeDither)
 
 enum_start (gegl_palette_quantize_alpha)
-  enum_value (GEGL_PQ_ALPHA_PRESERVE,  "preserve",  "Preserve alpha")
-  enum_value (GEGL_PQ_ALPHA_OPAQUE,    "opaque",    "Opaque (ignore alpha)")
-  enum_value (GEGL_PQ_ALPHA_COMPOSITE, "composite", "Composite over background")
+  enum_value (GEGL_PQ_ALPHA_PRESERVE,  "preserve",        "Preserve alpha")
+  enum_value (GEGL_PQ_ALPHA_OPAQUE,    "opaque",          "Opaque (ignore alpha)")
+  enum_value (GEGL_PQ_ALPHA_COMPOSITE, "composite",       "Composite over background")
+  enum_value (GEGL_PQ_ALPHA_DIR_POS,   "directional-pos", "Directional background (position)")
+  enum_value (GEGL_PQ_ALPHA_DIR_EDGE,  "directional-edge","Directional emboss (edges)")
 enum_end (GeglPaletteQuantizeAlpha)
 
 property_string (palette, "Palette", "#000000;#ffffff")
@@ -90,6 +95,25 @@ property_enum (alpha, "Alpha",
 
 property_color (background, "Background", "white")
   description ("Backdrop color used by the 'composite over background' alpha mode")
+
+property_color (color_top, "Top color", "white")
+  description ("Directional color for the top / light direction")
+property_color (color_right, "Right color", "gray")
+  description ("Directional color for the right direction")
+property_color (color_bottom, "Bottom color", "black")
+  description ("Directional color for the bottom / shadow direction")
+property_color (color_left, "Left color", "gray")
+  description ("Directional color for the left direction")
+
+property_double (direction, "Direction", 0.0)
+  value_range (0.0, 360.0)
+  ui_range    (0.0, 360.0)
+  description ("Lighting direction (degrees) for the directional alpha modes")
+
+property_double (relief, "Relief", 0.5)
+  value_range (0.0, 1.0)
+  ui_range    (0.0, 1.0)
+  description ("Emboss depth for the 'directional emboss (edges)' alpha mode")
 
 property_double (strength, "Strength", 1.0)
   value_range (0.0, 1.0)
@@ -129,6 +153,9 @@ typedef struct
   const Babl *from_rgb;  /* fish: "R'G'B' float" -> metric space (3 ch)      */
   gfloat      amp;       /* ordered-dither amplitude (mean palette spacing)  */
   gfloat      bg[3];     /* background color (sRGB), for composite mode      */
+  gfloat      dir_col[4][3]; /* directional colors sRGB: 0=top 1=right 2=bottom 3=left */
+  gfloat      dir;       /* lighting direction, radians                      */
+  gfloat      relief;    /* emboss depth for directional-edge mode           */
 } PaletteCache;
 
 static const gint bayer8[8][8] = {
@@ -196,6 +223,14 @@ static inline gboolean
 is_error_diffusion (gint dither)
 {
   return dither >= GEGL_PQ_DITHER_FS;
+}
+
+/* Modes that need the whole image in one process() call: error diffusion (to
+ * avoid tile seams) and edge emboss (it reads neighboring pixels). */
+static inline gboolean
+needs_whole_image (gint dither, gint alpha)
+{
+  return is_error_diffusion (dither) || alpha == GEGL_PQ_ALPHA_DIR_EDGE;
 }
 
 static const gchar *
@@ -336,6 +371,15 @@ palette_cache_build (const gchar *palette_str, gint metric)
   c->from_rgb = babl_fish (babl_format ("R'G'B' float"), fmt);
   c->bg[0] = c->bg[1] = c->bg[2] = 1.0f;   /* default white; set in prepare */
 
+  /* Directional defaults (overwritten in prepare): top white, sides gray,
+   * bottom black — a plausible top-lit emboss. */
+  c->dir_col[0][0] = c->dir_col[0][1] = c->dir_col[0][2] = 1.0f;  /* top    */
+  c->dir_col[1][0] = c->dir_col[1][1] = c->dir_col[1][2] = 0.5f;  /* right  */
+  c->dir_col[2][0] = c->dir_col[2][1] = c->dir_col[2][2] = 0.0f;  /* bottom */
+  c->dir_col[3][0] = c->dir_col[3][1] = c->dir_col[3][2] = 0.5f;  /* left   */
+  c->dir    = 0.0f;
+  c->relief = 0.5f;
+
   for (guint i = 0; i < n; i++)
     {
       PaletteColor pc = g_array_index (colors, PaletteColor, i);
@@ -373,30 +417,132 @@ palette_cache_build (const gchar *palette_str, gint metric)
 
 /* -------- per-mode processing over an interleaved R'G'B'A float buffer ----- */
 
+static inline gfloat
+samp_a (const gfloat *buf, glong w, glong h, glong x, glong y)
+{
+  x = CLAMP (x, 0, w - 1);
+  y = CLAMP (y, 0, h - 1);
+  return buf[((gsize) y * w + x) * 4 + 3];
+}
+
+static inline gfloat
+samp_luma (const gfloat *buf, glong w, glong h, glong x, glong y)
+{
+  const gfloat *p;
+  x = CLAMP (x, 0, w - 1);
+  y = CLAMP (y, 0, h - 1);
+  p = buf + ((gsize) y * w + x) * 4;
+  return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
+}
+
+/* Blend the four directional colors by a (screen-space) unit vector, rotated
+ * by the lighting direction. Screen y points down; top = -y. */
+static void
+blend_dir (const PaletteCache *c, gfloat vx, gfloat vy, gfloat out[3])
+{
+  gfloat ca = cosf (-c->dir), sa = sinf (-c->dir);
+  gfloat rx = vx * ca - vy * sa;
+  gfloat ry = vx * sa + vy * ca;
+  gfloat wR = fmaxf (0.0f, rx), wL = fmaxf (0.0f, -rx);
+  gfloat wT = fmaxf (0.0f, -ry), wB = fmaxf (0.0f, ry);
+  gfloat sum = wR + wL + wT + wB;
+
+  if (sum < 1e-6f)
+    {
+      for (gint k = 0; k < 3; k++)
+        out[k] = 0.25f * (c->dir_col[0][k] + c->dir_col[1][k] +
+                          c->dir_col[2][k] + c->dir_col[3][k]);
+      return;
+    }
+
+  for (gint k = 0; k < 3; k++)
+    out[k] = (c->dir_col[0][k] * wT + c->dir_col[1][k] * wR +
+              c->dir_col[2][k] * wB + c->dir_col[3][k] * wL) / sum;
+}
+
 /* Build the straight-RGB color that will be matched and used as the blend
- * source, per alpha mode. For 'composite', blend over the background color. */
+ * source, per alpha mode. Handles composite-over-background and the two
+ * directional modes (position gradient and edge emboss). */
 static void
 build_src (const PaletteCache *c, const gfloat *buf, gfloat *src,
-           glong npix, gint amode)
+           glong w, glong h, glong ox, glong oy, gint amode,
+           gfloat bcx, gfloat bcy)
 {
-  for (glong i = 0; i < npix; i++)
-    {
-      gfloat a = buf[i * 4 + 3];
+  for (glong y = 0; y < h; y++)
+    for (glong x = 0; x < w; x++)
+      {
+        gsize         p  = (gsize) y * w + x;
+        const gfloat *px = buf + p * 4;
+        gfloat        a  = px[3];
+        gfloat       *d  = src + p * 3;
 
-      if (amode == GEGL_PQ_ALPHA_COMPOSITE && a < 1.0f)
-        {
-          gfloat ia = 1.0f - a;
-          src[i * 3 + 0] = buf[i * 4 + 0] * a + c->bg[0] * ia;
-          src[i * 3 + 1] = buf[i * 4 + 1] * a + c->bg[1] * ia;
-          src[i * 3 + 2] = buf[i * 4 + 2] * a + c->bg[2] * ia;
-        }
-      else
-        {
-          src[i * 3 + 0] = buf[i * 4 + 0];
-          src[i * 3 + 1] = buf[i * 4 + 1];
-          src[i * 3 + 2] = buf[i * 4 + 2];
-        }
-    }
+        switch (amode)
+          {
+          case GEGL_PQ_ALPHA_COMPOSITE:
+            if (a < 1.0f)
+              {
+                gfloat ia = 1.0f - a;
+                d[0] = px[0] * a + c->bg[0] * ia;
+                d[1] = px[1] * a + c->bg[1] * ia;
+                d[2] = px[2] * a + c->bg[2] * ia;
+              }
+            else
+              {
+                d[0] = px[0]; d[1] = px[1]; d[2] = px[2];
+              }
+            break;
+
+          case GEGL_PQ_ALPHA_DIR_POS:
+            {
+              gfloat bd[3];
+              gfloat vx  = (gfloat) (ox + x) - bcx;
+              gfloat vy  = (gfloat) (oy + y) - bcy;
+              gfloat len = sqrtf (vx * vx + vy * vy);
+              gfloat ia  = 1.0f - a;
+
+              if (len > 1e-6f) { vx /= len; vy /= len; } else { vx = vy = 0.0f; }
+              blend_dir (c, vx, vy, bd);
+
+              d[0] = px[0] * a + bd[0] * ia;
+              d[1] = px[1] * a + bd[1] * ia;
+              d[2] = px[2] * a + bd[2] * ia;
+            }
+            break;
+
+          case GEGL_PQ_ALPHA_DIR_EDGE:
+            {
+              gfloat gx  = (samp_a (buf, w, h, x + 1, y) - samp_a (buf, w, h, x - 1, y)) * 0.5f;
+              gfloat gy  = (samp_a (buf, w, h, x, y + 1) - samp_a (buf, w, h, x, y - 1)) * 0.5f;
+              gfloat mag = sqrtf (gx * gx + gy * gy);
+              gfloat tint[3];
+              gfloat relf;
+
+              if (mag < 1e-4f)   /* flat alpha: emboss color edges instead */
+                {
+                  gx  = (samp_luma (buf, w, h, x + 1, y) - samp_luma (buf, w, h, x - 1, y)) * 0.5f;
+                  gy  = (samp_luma (buf, w, h, x, y + 1) - samp_luma (buf, w, h, x, y - 1)) * 0.5f;
+                  mag = sqrtf (gx * gx + gy * gy);
+                }
+
+              if (mag > 1e-6f)
+                blend_dir (c, gx / mag, gy / mag, tint);
+              else
+                { tint[0] = px[0]; tint[1] = px[1]; tint[2] = px[2]; }
+
+              relf = CLAMP (mag * 2.0f * c->relief, 0.0f, 1.0f);
+              d[0] = px[0] + (tint[0] - px[0]) * relf;
+              d[1] = px[1] + (tint[1] - px[1]) * relf;
+              d[2] = px[2] + (tint[2] - px[2]) * relf;
+            }
+            break;
+
+          case GEGL_PQ_ALPHA_PRESERVE:
+          case GEGL_PQ_ALPHA_OPAQUE:
+          default:
+            d[0] = px[0]; d[1] = px[1]; d[2] = px[2];
+            break;
+          }
+      }
 }
 
 static inline gfloat
@@ -408,13 +554,14 @@ out_alpha (gint amode, gfloat a)
 /* Non-diffusing modes: none (pattern 0), ordered Bayer (1), blue noise (2). */
 static void
 process_ordered (const PaletteCache *c, gfloat *buf, glong w, glong h,
-                 glong ox, glong oy, gfloat strength, gint pattern, gint amode)
+                 glong ox, glong oy, gfloat strength, gint pattern, gint amode,
+                 gfloat bcx, gfloat bcy)
 {
   glong   npix = w * h;
   gfloat *src  = g_new (gfloat, (gsize) npix * 3);   /* match & blend source  */
   gfloat *cm   = g_new (gfloat, (gsize) npix * 3);   /* src in metric space   */
 
-  build_src (c, buf, src, npix, amode);
+  build_src (c, buf, src, w, h, ox, oy, amode, bcx, bcy);
   babl_process (c->from_rgb, src, cm, npix);
 
   for (glong y = 0; y < h; y++)
@@ -458,7 +605,8 @@ process_ordered (const PaletteCache *c, gfloat *buf, glong w, glong h,
  * scanning. Diffuses in the metric space; matching stays exact. */
 static void
 process_diffuse (const PaletteCache *c, gfloat *buf, glong w, glong h,
-                 gfloat strength, gint amode, gint dither, gboolean serpentine)
+                 glong ox, glong oy, gfloat strength, gint amode, gint dither,
+                 gboolean serpentine, gfloat bcx, gfloat bcy)
 {
   glong          npix = w * h;
   gfloat        *src  = g_new (gfloat, (gsize) npix * 3);   /* blend source     */
@@ -468,7 +616,7 @@ process_diffuse (const PaletteCache *c, gfloat *buf, glong w, glong h,
 
   diffusion_kernel (dither, &taps, &ntaps, &divisor);
 
-  build_src (c, buf, src, npix, amode);
+  build_src (c, buf, src, w, h, ox, oy, amode, bcx, bcy);
   babl_process (c->from_rgb, src, wm, npix);
 
   for (glong y = 0; y < h; y++)
@@ -536,8 +684,10 @@ process (GeglOperation       *operation,
   GeglProperties     *o      = GEGL_PROPERTIES (operation);
   const PaletteCache *c      = o->user_data;
   const Babl         *format = babl_format ("R'G'B'A float");
+  GeglRectangle      *bbox;
   gfloat             *buf;
   gfloat              strength;
+  gfloat              bcx, bcy;
   gint                amode;
 
   (void) level;
@@ -548,21 +698,34 @@ process (GeglOperation       *operation,
   strength = CLAMP ((gfloat) o->strength, 0.0f, 1.0f);
   amode    = o->alpha;
 
+  /* Layer center (absolute coords) for the position-based directional mode. */
+  bbox = gegl_operation_source_get_bounding_box (operation, "input");
+  if (bbox && bbox->width > 0 && bbox->height > 0)
+    {
+      bcx = bbox->x + bbox->width  * 0.5f;
+      bcy = bbox->y + bbox->height * 0.5f;
+    }
+  else
+    {
+      bcx = roi->x + roi->width  * 0.5f;
+      bcy = roi->y + roi->height * 0.5f;
+    }
+
   buf = g_new (gfloat, (gsize) roi->width * roi->height * 4);
   gegl_buffer_get (input, roi, 1.0, format, buf,
                    GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_CLAMP);
 
   if (is_error_diffusion (o->dither))
     {
-      process_diffuse (c, buf, roi->width, roi->height, strength, amode,
-                       o->dither, o->serpentine);
+      process_diffuse (c, buf, roi->width, roi->height, roi->x, roi->y,
+                       strength, amode, o->dither, o->serpentine, bcx, bcy);
     }
   else
     {
       gint pattern = (o->dither == GEGL_PQ_DITHER_ORDERED)   ? 1 :
                      (o->dither == GEGL_PQ_DITHER_BLUENOISE) ? 2 : 0;
       process_ordered (c, buf, roi->width, roi->height,
-                       roi->x, roi->y, strength, pattern, amode);
+                       roi->x, roi->y, strength, pattern, amode, bcx, bcy);
     }
 
   gegl_buffer_set (output, roi, 0, format, buf, GEGL_AUTO_ROWSTRIDE);
@@ -582,7 +745,7 @@ get_required_for_output (GeglOperation       *operation,
 
   (void) input_pad;
 
-  if (is_error_diffusion (o->dither))
+  if (needs_whole_image (o->dither, o->alpha))
     {
       GeglRectangle *in = gegl_operation_source_get_bounding_box (operation, "input");
       if (in)
@@ -597,7 +760,7 @@ get_cached_region (GeglOperation       *operation,
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
 
-  if (is_error_diffusion (o->dither))
+  if (needs_whole_image (o->dither, o->alpha))
     {
       GeglRectangle *in = gegl_operation_source_get_bounding_box (operation, "input");
       if (in)
@@ -623,6 +786,18 @@ prepare (GeglOperation *operation)
 
   if (o->background)
     gegl_color_get_pixel (o->background, babl_format ("R'G'B' float"), c->bg);
+
+  if (o->color_top)
+    gegl_color_get_pixel (o->color_top,    babl_format ("R'G'B' float"), c->dir_col[0]);
+  if (o->color_right)
+    gegl_color_get_pixel (o->color_right,  babl_format ("R'G'B' float"), c->dir_col[1]);
+  if (o->color_bottom)
+    gegl_color_get_pixel (o->color_bottom, babl_format ("R'G'B' float"), c->dir_col[2]);
+  if (o->color_left)
+    gegl_color_get_pixel (o->color_left,   babl_format ("R'G'B' float"), c->dir_col[3]);
+
+  c->dir    = (gfloat) (o->direction * G_PI / 180.0);
+  c->relief = (gfloat) o->relief;
 
   o->user_data = c;
 }

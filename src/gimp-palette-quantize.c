@@ -191,6 +191,10 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                      "Quantize the pixel's own color, output fully opaque");
     gimp_choice_add (alpha, "composite", 2, "Composite over background",
                      "Blend over the background color, then quantize, output opaque");
+    gimp_choice_add (alpha, "directional-pos",  3, "Directional background (position)",
+                     "Composite over a 4-color directional gradient backdrop");
+    gimp_choice_add (alpha, "directional-edge", 4, "Directional emboss (edges)",
+                     "Tint shape/color edges by direction for a pseudo-emboss");
 
     gimp_procedure_add_choice_argument (procedure,
                                         "alpha",
@@ -216,6 +220,42 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                                        white,
                                        G_PARAM_READWRITE);
   }
+
+  /* Four directional colors + direction/relief, for the directional alpha
+   * modes. GeglColor passes straight through (same type on both sides). */
+  {
+    GeglColor *c_top    = gegl_color_new ("white");
+    GeglColor *c_right  = gegl_color_new ("gray");
+    GeglColor *c_bottom = gegl_color_new ("black");
+    GeglColor *c_left   = gegl_color_new ("gray");
+
+    gimp_procedure_add_color_argument (procedure, "color-top", "Top color",
+                                       "Directional color toward the top / light",
+                                       FALSE, c_top, G_PARAM_READWRITE);
+    gimp_procedure_add_color_argument (procedure, "color-right", "Right color",
+                                       "Directional color toward the right",
+                                       FALSE, c_right, G_PARAM_READWRITE);
+    gimp_procedure_add_color_argument (procedure, "color-bottom", "Bottom color",
+                                       "Directional color toward the bottom / shadow",
+                                       FALSE, c_bottom, G_PARAM_READWRITE);
+    gimp_procedure_add_color_argument (procedure, "color-left", "Left color",
+                                       "Directional color toward the left",
+                                       FALSE, c_left, G_PARAM_READWRITE);
+  }
+
+  gimp_procedure_add_double_argument (procedure,
+                                      "direction",
+                                      "_Direction",
+                                      "Lighting direction in degrees (directional alpha modes)",
+                                      0.0, 360.0, 0.0,
+                                      G_PARAM_READWRITE);
+
+  gimp_procedure_add_double_argument (procedure,
+                                      "relief",
+                                      "_Relief",
+                                      "Emboss depth for the 'directional emboss (edges)' mode",
+                                      0.0, 1.0, 0.5,
+                                      G_PARAM_READWRITE);
 
   return procedure;
 }
@@ -276,6 +316,12 @@ show_dialog (GimpProcedure       *procedure,
                               "serpentine",
                               "alpha",
                               "background",
+                              "color-top",
+                              "color-right",
+                              "color-bottom",
+                              "color-left",
+                              "direction",
+                              "relief",
                               "strength",
                               "non-destructive",
                               NULL);
@@ -304,6 +350,12 @@ palette_quantize_run (GimpProcedure        *procedure,
   gchar            *dither = NULL;
   gchar            *alpha = NULL;
   GeglColor        *background = NULL;
+  GeglColor        *color_top = NULL;
+  GeglColor        *color_right = NULL;
+  GeglColor        *color_bottom = NULL;
+  GeglColor        *color_left = NULL;
+  gdouble           direction = 0.0;
+  gdouble           relief = 0.5;
   gint              n_drawables;
 
   (void) run_data;
@@ -333,6 +385,12 @@ palette_quantize_run (GimpProcedure        *procedure,
                 "dither", &dither,
                 "alpha", &alpha,
                 "background", &background,
+                "color-top", &color_top,
+                "color-right", &color_right,
+                "color-bottom", &color_bottom,
+                "color-left", &color_left,
+                "direction", &direction,
+                "relief", &relief,
                 NULL);
 
   /* GIMP mirrors the GEGL op's enum properties into the drawable-filter config
@@ -348,6 +406,14 @@ palette_quantize_run (GimpProcedure        *procedure,
     alpha = g_strdup ("composite");
   if (! background)
     background = gegl_color_new ("white");
+  if (! color_top)
+    color_top = gegl_color_new ("white");
+  if (! color_right)
+    color_right = gegl_color_new ("gray");
+  if (! color_bottom)
+    color_bottom = gegl_color_new ("black");
+  if (! color_left)
+    color_left = gegl_color_new ("gray");
 
   strength = CLAMP (strength, 0.0, 1.0);
   hex_palette = palette_to_hex_string (palette, &error);
@@ -379,6 +445,24 @@ palette_quantize_run (GimpProcedure        *procedure,
                                                 "serpentine", serpentine,
                                                 "alpha", alpha,
                                                 "background", background,
+                                      "color-top", color_top,
+                                      "color-right", color_right,
+                                      "color-bottom", color_bottom,
+                                      "color-left", color_left,
+                                      "direction", direction,
+                                      "relief", relief,
+                                          "color-top", color_top,
+                                          "color-right", color_right,
+                                          "color-bottom", color_bottom,
+                                          "color-left", color_left,
+                                          "direction", direction,
+                                          "relief", relief,
+                                                "color-top", color_top,
+                                                "color-right", color_right,
+                                                "color-bottom", color_bottom,
+                                                "color-left", color_left,
+                                                "direction", direction,
+                                                "relief", relief,
                                                 "strength", strength,
                                                 NULL);
       if (! filter)
@@ -394,6 +478,18 @@ palette_quantize_run (GimpProcedure        *procedure,
                                           "serpentine", serpentine,
                                           "alpha", alpha,
                                           "background", background,
+                                      "color-top", color_top,
+                                      "color-right", color_right,
+                                      "color-bottom", color_bottom,
+                                      "color-left", color_left,
+                                      "direction", direction,
+                                      "relief", relief,
+                                          "color-top", color_top,
+                                          "color-right", color_right,
+                                          "color-bottom", color_bottom,
+                                          "color-left", color_left,
+                                          "direction", direction,
+                                          "relief", relief,
                                           "strength", strength,
                                           NULL);
         }
@@ -411,6 +507,12 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "serpentine", serpentine,
                                       "alpha", alpha,
                                       "background", background,
+                                      "color-top", color_top,
+                                      "color-right", color_right,
+                                      "color-bottom", color_bottom,
+                                      "color-left", color_left,
+                                      "direction", direction,
+                                      "relief", relief,
                                       "strength", strength,
                                       NULL);
     }
@@ -423,6 +525,10 @@ palette_quantize_run (GimpProcedure        *procedure,
   g_free (dither);
   g_free (alpha);
   g_clear_object (&background);
+  g_clear_object (&color_top);
+  g_clear_object (&color_right);
+  g_clear_object (&color_bottom);
+  g_clear_object (&color_left);
 
   return gimp_procedure_new_return_values (procedure, status, NULL);
 }
