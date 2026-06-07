@@ -27,10 +27,20 @@ and usually give more natural matches for photographic content.
 The **Dithering** dropdown distributes quantization error to reduce banding:
 
 - `None` — hard nearest-color mapping.
-- `Ordered (Bayer 8x8)` — fast, position-based; tiles seamlessly and previews
-  cheaply.
-- `Floyd-Steinberg` — error diffusion; higher quality, but processes the whole
-  layer at once (heavier for large layers / live previews).
+- `Ordered (Bayer 8x8)` — fast, position-based; regular cross-hatch texture.
+- `Blue noise` — position-based like ordered, but a natural, non-repeating
+  texture (no cross-hatch). Cheap and tiles seamlessly.
+- `Floyd-Steinberg` — classic error diffusion.
+- `Atkinson` — error diffusion that distributes only part of the error, so
+  flat areas stay cleaner (less busy). Good when you want to "respect" flats.
+- `Jarvis-Judice-Ninke`, `Stucki` — large-kernel error diffusion; smoother,
+  more natural gradients.
+- `Sierra` — balanced error diffusion.
+
+The position-based modes (ordered, blue noise) are cheap and tile seamlessly.
+The error-diffusion modes process the whole layer at once (heavier for large
+layers / live previews). For them, the **Serpentine scan** toggle alternates
+the row direction to remove the diagonal "worm" artifacts.
 
 The **Alpha** dropdown controls how transparency is handled so the *visible*
 pixel can be an exact palette color:

@@ -150,8 +150,18 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                      "Hard nearest-color quantization");
     gimp_choice_add (dither, "ordered",         1, "Ordered (Bayer 8x8)",
                      "Position-based ordered dithering");
-    gimp_choice_add (dither, "floyd-steinberg", 2, "Floyd-Steinberg",
-                     "Error-diffusion dithering (whole layer)");
+    gimp_choice_add (dither, "blue-noise",      2, "Blue noise",
+                     "Ordered dithering with a natural, non-repeating noise");
+    gimp_choice_add (dither, "floyd-steinberg", 3, "Floyd-Steinberg",
+                     "Error diffusion (whole layer)");
+    gimp_choice_add (dither, "atkinson",        4, "Atkinson",
+                     "Error diffusion that keeps flat areas clean");
+    gimp_choice_add (dither, "jarvis",          5, "Jarvis-Judice-Ninke",
+                     "Large-kernel error diffusion (smooth)");
+    gimp_choice_add (dither, "stucki",          6, "Stucki",
+                     "Large-kernel error diffusion (smooth)");
+    gimp_choice_add (dither, "sierra",          7, "Sierra",
+                     "Error diffusion (balanced)");
 
     gimp_procedure_add_choice_argument (procedure,
                                         "dither",
@@ -161,6 +171,13 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                                         "none",
                                         G_PARAM_READWRITE);
   }
+
+  gimp_procedure_add_boolean_argument (procedure,
+                                       "serpentine",
+                                       "Serpe_ntine scan",
+                                       "Alternate row direction for error-diffusion dithers (reduces worm artifacts)",
+                                       FALSE,
+                                       G_PARAM_READWRITE);
 
   /* Alpha handling. Nicks MUST match the GEGL op's GeglPaletteQuantizeAlpha
    * enum nicks. Default "composite" so the visible color is an exact palette
@@ -256,6 +273,7 @@ show_dialog (GimpProcedure       *procedure,
                               "palette",
                               "metric",
                               "dither",
+                              "serpentine",
                               "alpha",
                               "background",
                               "strength",
@@ -281,6 +299,7 @@ palette_quantize_run (GimpProcedure        *procedure,
   gchar            *hex_palette = NULL;
   gdouble           strength = 1.0;
   gboolean          non_destructive = TRUE;
+  gboolean          serpentine = FALSE;
   gchar            *metric = NULL;
   gchar            *dither = NULL;
   gchar            *alpha = NULL;
@@ -309,6 +328,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                 "palette", &palette,
                 "strength", &strength,
                 "non-destructive", &non_destructive,
+                "serpentine", &serpentine,
                 "metric", &metric,
                 "dither", &dither,
                 "alpha", &alpha,
@@ -356,6 +376,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                                 "palette", hex_palette,
                                                 "metric", metric,
                                                 "dither", dither,
+                                                "serpentine", serpentine,
                                                 "alpha", alpha,
                                                 "background", background,
                                                 "strength", strength,
@@ -370,6 +391,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                           "palette", hex_palette,
                                           "metric", metric,
                                           "dither", dither,
+                                          "serpentine", serpentine,
                                           "alpha", alpha,
                                           "background", background,
                                           "strength", strength,
@@ -386,6 +408,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "palette", hex_palette,
                                       "metric", metric,
                                       "dither", dither,
+                                      "serpentine", serpentine,
                                       "alpha", alpha,
                                       "background", background,
                                       "strength", strength,

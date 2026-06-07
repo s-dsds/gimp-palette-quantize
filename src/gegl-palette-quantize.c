@@ -7,7 +7,8 @@
  *
  * Features:
  *   - distance metric: sRGB / linear RGB / CIE Lab / OKLab
- *   - dithering:       none / ordered (Bayer 8x8) / Floyd-Steinberg
+ *   - dithering:       none / ordered (Bayer) / blue noise / Floyd-Steinberg /
+ *                      Atkinson / Jarvis / Stucki / Sierra (+ serpentine)
  *   - alpha handling:  preserve / opaque / composite over a background color
  *   - strength:        blend between original and quantized result
  *
@@ -50,9 +51,14 @@ enum_start (gegl_palette_quantize_metric)
 enum_end (GeglPaletteQuantizeMetric)
 
 enum_start (gegl_palette_quantize_dither)
-  enum_value (GEGL_PQ_DITHER_NONE,    "none",            "None")
-  enum_value (GEGL_PQ_DITHER_ORDERED, "ordered",         "Ordered (Bayer 8x8)")
-  enum_value (GEGL_PQ_DITHER_FS,      "floyd-steinberg", "Floyd-Steinberg")
+  enum_value (GEGL_PQ_DITHER_NONE,      "none",            "None")
+  enum_value (GEGL_PQ_DITHER_ORDERED,   "ordered",         "Ordered (Bayer 8x8)")
+  enum_value (GEGL_PQ_DITHER_BLUENOISE, "blue-noise",      "Blue noise")
+  enum_value (GEGL_PQ_DITHER_FS,        "floyd-steinberg", "Floyd-Steinberg")
+  enum_value (GEGL_PQ_DITHER_ATKINSON,  "atkinson",        "Atkinson")
+  enum_value (GEGL_PQ_DITHER_JJN,       "jarvis",          "Jarvis-Judice-Ninke")
+  enum_value (GEGL_PQ_DITHER_STUCKI,    "stucki",          "Stucki")
+  enum_value (GEGL_PQ_DITHER_SIERRA,    "sierra",          "Sierra")
 enum_end (GeglPaletteQuantizeDither)
 
 enum_start (gegl_palette_quantize_alpha)
@@ -73,6 +79,9 @@ property_enum (dither, "Dithering",
                GeglPaletteQuantizeDither, gegl_palette_quantize_dither,
                GEGL_PQ_DITHER_NONE)
   description ("Dithering method used to distribute quantization error")
+
+property_boolean (serpentine, "Serpentine", FALSE)
+  description ("Alternate row direction for the error-diffusion dithers (reduces directional 'worm' artifacts)")
 
 property_enum (alpha, "Alpha",
                GeglPaletteQuantizeAlpha, gegl_palette_quantize_alpha,
@@ -132,6 +141,62 @@ static const gint bayer8[8][8] = {
   { 15, 47,  7, 39, 13, 45,  5, 37 },
   { 63, 31, 55, 23, 61, 29, 53, 21 }
 };
+
+/* Interleaved gradient noise (Jorge Jimenez): a cheap, table-free dither with
+ * blue-noise-like spectral character — far more natural than Bayer. */
+static inline gfloat
+ign (gint x, gint y)
+{
+  gfloat f = 0.06711056f * (gfloat) x + 0.00583715f * (gfloat) y;
+  return fmodf (52.9829189f * fmodf (f, 1.0f), 1.0f);
+}
+
+/* A position-based dither offset in [-0.5, 0.5) * amp, added to the metric
+ * coordinates before matching. pattern: 0 = none, 1 = Bayer, 2 = blue noise. */
+static inline gfloat
+ordered_offset (gint pattern, gint x, gint y, gfloat amp)
+{
+  switch (pattern)
+    {
+    case 1:  return (((bayer8[y & 7][x & 7] + 0.5f) / 64.0f) - 0.5f) * amp;
+    case 2:  return (ign (x, y) - 0.5f) * amp;
+    default: return 0.0f;
+    }
+}
+
+/* Error-diffusion kernels: forward taps (dy > 0, or dy == 0 && dx > 0). */
+typedef struct { gint dx, dy, w; } DiffTap;
+
+static const DiffTap K_FS[]  = { {1,0,7},{-1,1,3},{0,1,5},{1,1,1} };
+static const DiffTap K_ATK[] = { {1,0,1},{2,0,1},{-1,1,1},{0,1,1},{1,1,1},{0,2,1} };
+static const DiffTap K_JJN[] = { {1,0,7},{2,0,5},{-2,1,3},{-1,1,5},{0,1,7},{1,1,5},
+                                 {2,1,3},{-2,2,1},{-1,2,3},{0,2,5},{1,2,3},{2,2,1} };
+static const DiffTap K_STK[] = { {1,0,8},{2,0,4},{-2,1,2},{-1,1,4},{0,1,8},{1,1,4},
+                                 {2,1,2},{-2,2,1},{-1,2,2},{0,2,4},{1,2,2},{2,2,1} };
+static const DiffTap K_SIE[] = { {1,0,5},{2,0,3},{-2,1,2},{-1,1,4},{0,1,5},{1,1,4},
+                                 {2,1,3},{-1,2,2},{0,2,3},{1,2,2} };
+
+/* Atkinson divides by 8 but distributes only 6/8 of the error, deliberately
+ * dropping 1/4 — this is what keeps flat areas clean. */
+static void
+diffusion_kernel (gint dither, const DiffTap **taps, gint *n, gint *divisor)
+{
+  switch (dither)
+    {
+    case GEGL_PQ_DITHER_ATKINSON: *taps = K_ATK; *n = G_N_ELEMENTS (K_ATK); *divisor = 8;  break;
+    case GEGL_PQ_DITHER_JJN:      *taps = K_JJN; *n = G_N_ELEMENTS (K_JJN); *divisor = 48; break;
+    case GEGL_PQ_DITHER_STUCKI:   *taps = K_STK; *n = G_N_ELEMENTS (K_STK); *divisor = 42; break;
+    case GEGL_PQ_DITHER_SIERRA:   *taps = K_SIE; *n = G_N_ELEMENTS (K_SIE); *divisor = 32; break;
+    case GEGL_PQ_DITHER_FS:
+    default:                      *taps = K_FS;  *n = G_N_ELEMENTS (K_FS);  *divisor = 16; break;
+    }
+}
+
+static inline gboolean
+is_error_diffusion (gint dither)
+{
+  return dither >= GEGL_PQ_DITHER_FS;
+}
 
 static const gchar *
 metric_format (gint metric)
@@ -340,9 +405,10 @@ out_alpha (gint amode, gfloat a)
   return (amode == GEGL_PQ_ALPHA_PRESERVE) ? a : 1.0f;
 }
 
+/* Non-diffusing modes: none (pattern 0), ordered Bayer (1), blue noise (2). */
 static void
-process_simple (const PaletteCache *c, gfloat *buf, glong w, glong h,
-                glong ox, glong oy, gfloat strength, gboolean ordered, gint amode)
+process_ordered (const PaletteCache *c, gfloat *buf, glong w, glong h,
+                 glong ox, glong oy, gfloat strength, gint pattern, gint amode)
 {
   glong   npix = w * h;
   gfloat *src  = g_new (gfloat, (gsize) npix * 3);   /* match & blend source  */
@@ -359,24 +425,22 @@ process_simple (const PaletteCache *c, gfloat *buf, glong w, glong h,
         const gfloat *s  = src + p * 3;
         const gfloat *m  = cm + p * 3;
         gfloat        a  = px[3];
-        gfloat        mm[3];
         const gfloat *q;
         guint         idx;
 
         if (a <= 0.0f)
           continue;  /* fully transparent stays transparent */
 
-        if (ordered)
+        if (pattern == 0)
           {
-            gint   bx  = (gint) ((ox + x) & 7);
-            gint   by  = (gint) ((oy + y) & 7);
-            gfloat off = (((bayer8[by][bx] + 0.5f) / 64.0f) - 0.5f) * c->amp;
-            mm[0] = m[0] + off; mm[1] = m[1] + off; mm[2] = m[2] + off;
-            idx = nearest_exact (mm, c);
+            idx = nearest_exact (m, c);
           }
         else
           {
-            idx = nearest_exact (m, c);
+            gfloat off = ordered_offset (pattern, (gint) (ox + x), (gint) (oy + y), c->amp);
+            gfloat mm[3];
+            mm[0] = m[0] + off; mm[1] = m[1] + off; mm[2] = m[2] + off;
+            idx = nearest_exact (mm, c);
           }
 
         q = c->srgb + idx * 3;
@@ -390,76 +454,73 @@ process_simple (const PaletteCache *c, gfloat *buf, glong w, glong h,
   g_free (cm);
 }
 
+/* Error-diffusion modes, generic over the kernel, with optional serpentine
+ * scanning. Diffuses in the metric space; matching stays exact. */
 static void
-process_floyd_steinberg (const PaletteCache *c, gfloat *buf, glong w, glong h,
-                         gfloat strength, gint amode)
+process_diffuse (const PaletteCache *c, gfloat *buf, glong w, glong h,
+                 gfloat strength, gint amode, gint dither, gboolean serpentine)
 {
-  glong   npix = w * h;
-  gfloat *src  = g_new (gfloat, (gsize) npix * 3);   /* blend source          */
-  gfloat *wm   = g_new (gfloat, (gsize) npix * 3);   /* working metric values */
+  glong          npix = w * h;
+  gfloat        *src  = g_new (gfloat, (gsize) npix * 3);   /* blend source     */
+  gfloat        *wm   = g_new (gfloat, (gsize) npix * 3);   /* working metric   */
+  const DiffTap *taps;
+  gint           ntaps, divisor;
+
+  diffusion_kernel (dither, &taps, &ntaps, &divisor);
 
   build_src (c, buf, src, npix, amode);
   babl_process (c->from_rgb, src, wm, npix);
 
   for (glong y = 0; y < h; y++)
-    for (glong x = 0; x < w; x++)
-      {
-        gsize         p   = (gsize) y * w + x;
-        gfloat       *px  = buf + p * 4;
-        const gfloat *s   = src + p * 3;
-        gfloat       *m   = wm + p * 3;
-        gfloat        a   = px[3];
-        const gfloat *q;
-        guint         idx;
-        gfloat        e0, e1, e2;
+    {
+      gboolean l2r = ! (serpentine && (y & 1));
 
-        if (a <= 0.0f)
-          continue;  /* leave transparent pixels untouched, no diffusion */
+      for (glong k = 0; k < w; k++)
+        {
+          glong         x   = l2r ? k : (w - 1 - k);
+          gsize         p   = (gsize) y * w + x;
+          gfloat       *px  = buf + p * 4;
+          const gfloat *s   = src + p * 3;
+          gfloat       *m   = wm + p * 3;
+          gfloat        a   = px[3];
+          const gfloat *q;
+          guint         idx;
+          gfloat        e0, e1, e2;
 
-        idx = nearest_exact (m, c);
+          if (a <= 0.0f)
+            continue;  /* leave transparent pixels untouched, no diffusion */
 
-        e0 = m[0] - c->coord[idx * 3 + 0];
-        e1 = m[1] - c->coord[idx * 3 + 1];
-        e2 = m[2] - c->coord[idx * 3 + 2];
+          idx = nearest_exact (m, c);
 
-        /* Floyd-Steinberg distribution (in metric space): 7/16,3/16,5/16,1/16 */
-        if (x + 1 < w)
-          {
-            gfloat *nb = wm + (p + 1) * 3;
-            nb[0] += e0 * (7.0f / 16.0f);
-            nb[1] += e1 * (7.0f / 16.0f);
-            nb[2] += e2 * (7.0f / 16.0f);
-          }
-        if (y + 1 < h)
-          {
-            if (x > 0)
-              {
-                gfloat *nb = wm + (p + w - 1) * 3;
-                nb[0] += e0 * (3.0f / 16.0f);
-                nb[1] += e1 * (3.0f / 16.0f);
-                nb[2] += e2 * (3.0f / 16.0f);
-              }
+          e0 = m[0] - c->coord[idx * 3 + 0];
+          e1 = m[1] - c->coord[idx * 3 + 1];
+          e2 = m[2] - c->coord[idx * 3 + 2];
+
+          for (gint t = 0; t < ntaps; t++)
             {
-              gfloat *nb = wm + (p + w) * 3;
-              nb[0] += e0 * (5.0f / 16.0f);
-              nb[1] += e1 * (5.0f / 16.0f);
-              nb[2] += e2 * (5.0f / 16.0f);
-            }
-            if (x + 1 < w)
-              {
-                gfloat *nb = wm + (p + w + 1) * 3;
-                nb[0] += e0 * (1.0f / 16.0f);
-                nb[1] += e1 * (1.0f / 16.0f);
-                nb[2] += e2 * (1.0f / 16.0f);
-              }
-          }
+              gint   dx = l2r ? taps[t].dx : -taps[t].dx;
+              glong  nx = x + dx;
+              glong  ny = y + taps[t].dy;
+              gfloat wf;
+              gfloat *nb;
 
-        q = c->srgb + idx * 3;
-        px[0] = s[0] + (q[0] - s[0]) * strength;
-        px[1] = s[1] + (q[1] - s[1]) * strength;
-        px[2] = s[2] + (q[2] - s[2]) * strength;
-        px[3] = out_alpha (amode, a);
-      }
+              if (nx < 0 || nx >= w || ny < 0 || ny >= h)
+                continue;
+
+              wf = (gfloat) taps[t].w / (gfloat) divisor;
+              nb = wm + ((gsize) ny * w + nx) * 3;
+              nb[0] += e0 * wf;
+              nb[1] += e1 * wf;
+              nb[2] += e2 * wf;
+            }
+
+          q = c->srgb + idx * 3;
+          px[0] = s[0] + (q[0] - s[0]) * strength;
+          px[1] = s[1] + (q[1] - s[1]) * strength;
+          px[2] = s[2] + (q[2] - s[2]) * strength;
+          px[3] = out_alpha (amode, a);
+        }
+    }
 
   g_free (src);
   g_free (wm);
@@ -491,20 +552,17 @@ process (GeglOperation       *operation,
   gegl_buffer_get (input, roi, 1.0, format, buf,
                    GEGL_AUTO_ROWSTRIDE, GEGL_ABYSS_CLAMP);
 
-  switch (o->dither)
+  if (is_error_diffusion (o->dither))
     {
-    case GEGL_PQ_DITHER_FS:
-      process_floyd_steinberg (c, buf, roi->width, roi->height, strength, amode);
-      break;
-    case GEGL_PQ_DITHER_ORDERED:
-      process_simple (c, buf, roi->width, roi->height,
-                      roi->x, roi->y, strength, TRUE, amode);
-      break;
-    case GEGL_PQ_DITHER_NONE:
-    default:
-      process_simple (c, buf, roi->width, roi->height,
-                      roi->x, roi->y, strength, FALSE, amode);
-      break;
+      process_diffuse (c, buf, roi->width, roi->height, strength, amode,
+                       o->dither, o->serpentine);
+    }
+  else
+    {
+      gint pattern = (o->dither == GEGL_PQ_DITHER_ORDERED)   ? 1 :
+                     (o->dither == GEGL_PQ_DITHER_BLUENOISE) ? 2 : 0;
+      process_ordered (c, buf, roi->width, roi->height,
+                       roi->x, roi->y, strength, pattern, amode);
     }
 
   gegl_buffer_set (output, roi, 0, format, buf, GEGL_AUTO_ROWSTRIDE);
@@ -524,7 +582,7 @@ get_required_for_output (GeglOperation       *operation,
 
   (void) input_pad;
 
-  if (o->dither == GEGL_PQ_DITHER_FS)
+  if (is_error_diffusion (o->dither))
     {
       GeglRectangle *in = gegl_operation_source_get_bounding_box (operation, "input");
       if (in)
@@ -539,7 +597,7 @@ get_cached_region (GeglOperation       *operation,
 {
   GeglProperties *o = GEGL_PROPERTIES (operation);
 
-  if (o->dither == GEGL_PQ_DITHER_FS)
+  if (is_error_diffusion (o->dither))
     {
       GeglRectangle *in = gegl_operation_source_get_bounding_box (operation, "input");
       if (in)
