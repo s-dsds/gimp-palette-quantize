@@ -123,6 +123,11 @@ property_double (relief, "Relief", 0.5)
   ui_range    (0.0, 1.0)
   description ("Strength of the directional tint / bevel shading")
 
+property_double (threshold, "Alpha threshold", 0.5)
+  value_range (0.0, 1.0)
+  ui_range    (0.0, 1.0)
+  description ("Hard-edge coverage cutoff: pixels below become transparent, at/above become opaque (all modes except Preserve)")
+
 property_double (strength, "Strength", 1.0)
   value_range (0.0, 1.0)
   ui_range    (0.0, 1.0)
@@ -165,6 +170,7 @@ typedef struct
   gfloat      dir;       /* lighting/orientation direction, radians          */
   gfloat      relief;    /* tint/bevel strength                              */
   gfloat      width;     /* spread/bevel width in pixels                     */
+  gfloat      threshold; /* hard-edge alpha cutoff (non-preserve modes)      */
 } PaletteCache;
 
 static const gint bayer8[8][8] = {
@@ -434,9 +440,10 @@ palette_cache_build (const gchar *palette_str, gint metric)
   c->dir_col[1][0] = c->dir_col[1][1] = c->dir_col[1][2] = 0.5f;  /* right  */
   c->dir_col[2][0] = c->dir_col[2][1] = c->dir_col[2][2] = 0.0f;  /* bottom */
   c->dir_col[3][0] = c->dir_col[3][1] = c->dir_col[3][2] = 0.5f;  /* left   */
-  c->dir    = 0.0f;
-  c->relief = 0.5f;
-  c->width  = 4.0f;
+  c->dir       = 0.0f;
+  c->relief    = 0.5f;
+  c->width     = 4.0f;
+  c->threshold = 0.5f;
 
   for (guint i = 0; i < n; i++)
     {
@@ -768,8 +775,15 @@ process_ordered (const PaletteCache *c, gfloat *buf, glong w, glong h,
         const gfloat *q;
         guint         idx;
 
-        if (a <= 0.0f)
-          continue;  /* fully transparent stays transparent */
+        if (amode == GEGL_PQ_ALPHA_PRESERVE)
+          {
+            if (a <= 0.0f) continue;        /* keep the soft alpha */
+          }
+        else if (a < c->threshold)
+          {
+            px[3] = 0.0f;                    /* hard edge: below cutoff clears */
+            continue;
+          }
 
         if (pattern == 0)
           {
@@ -828,8 +842,15 @@ process_diffuse (const PaletteCache *c, gfloat *buf, glong w, glong h,
           guint         idx;
           gfloat        e0, e1, e2;
 
-          if (a <= 0.0f)
-            continue;  /* leave transparent pixels untouched, no diffusion */
+          if (amode == GEGL_PQ_ALPHA_PRESERVE)
+            {
+              if (a <= 0.0f) continue;       /* keep the soft alpha */
+            }
+          else if (a < c->threshold)
+            {
+              px[3] = 0.0f;                   /* hard edge: below cutoff clears */
+              continue;
+            }
 
           idx = nearest_exact (m, c);
 
@@ -989,9 +1010,10 @@ prepare (GeglOperation *operation)
   if (o->color_left)
     gegl_color_get_pixel (o->color_left,   babl_format ("R'G'B' float"), c->dir_col[3]);
 
-  c->dir    = (gfloat) (o->direction * G_PI / 180.0);
-  c->relief = (gfloat) o->relief;
-  c->width  = (gfloat) o->width;
+  c->dir       = (gfloat) (o->direction * G_PI / 180.0);
+  c->relief    = (gfloat) o->relief;
+  c->width     = (gfloat) o->width;
+  c->threshold = (gfloat) o->threshold;
 
   o->user_data = c;
 }

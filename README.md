@@ -69,9 +69,11 @@ surface normal, with four colors (**Top/Right/Bottom/Left**) and a
   edge, highlighting the side facing the light (Top color) and shadowing the
   opposite side (Bottom color); **Relief** = strength, **Direction** = light.
 
-In the opaque/composite modes the visible pixel is forced opaque; preserve and
-the directional recolor modes keep the stroke's original alpha. Fully
-transparent pixels (alpha = 0) are always left transparent. The **Background**
+Every mode except Preserve outputs fully opaque, exact palette colors. The
+**Alpha threshold** (default 0.5) gives hard edges: pixels with coverage below
+it become transparent, at/above become opaque — so anti-aliased edges resolve
+to a crisp boundary instead of a translucent halo. Preserve keeps the original
+alpha. The **Background**
 color drives composite mode; **Top/Right/Bottom/Left**, **Direction**,
 **Width** and **Relief** drive the directional/bevel modes.
 

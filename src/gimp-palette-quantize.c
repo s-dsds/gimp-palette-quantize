@@ -268,6 +268,13 @@ palette_quantize_create_procedure (GimpPlugIn  *plug_in,
                                       0.0, 1.0, 0.5,
                                       G_PARAM_READWRITE);
 
+  gimp_procedure_add_double_argument (procedure,
+                                      "threshold",
+                                      "Alpha _threshold",
+                                      "Hard-edge coverage cutoff: below becomes transparent, at/above opaque (all modes except Preserve)",
+                                      0.0, 1.0, 0.5,
+                                      G_PARAM_READWRITE);
+
   return procedure;
 }
 
@@ -334,6 +341,7 @@ show_dialog (GimpProcedure       *procedure,
                               "direction",
                               "width",
                               "relief",
+                              "threshold",
                               "strength",
                               "non-destructive",
                               NULL);
@@ -369,6 +377,7 @@ palette_quantize_run (GimpProcedure        *procedure,
   gdouble           direction = 0.0;
   gdouble           width = 4.0;
   gdouble           relief = 0.5;
+  gdouble           threshold = 0.5;
   gint              n_drawables;
 
   (void) run_data;
@@ -405,6 +414,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                 "direction", &direction,
                 "width", &width,
                 "relief", &relief,
+                "threshold", &threshold,
                 NULL);
 
   /* GIMP mirrors the GEGL op's enum properties into the drawable-filter config
@@ -466,6 +476,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "direction", direction,
                                       "width", width,
                                       "relief", relief,
+                                      "threshold", threshold,
                                           "color-top", color_top,
                                           "color-right", color_right,
                                           "color-bottom", color_bottom,
@@ -474,6 +485,8 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "width", width,
                                           "width", width,
                                           "relief", relief,
+                                      "threshold", threshold,
+                                          "threshold", threshold,
                                                 "color-top", color_top,
                                                 "color-right", color_right,
                                                 "color-bottom", color_bottom,
@@ -483,6 +496,9 @@ palette_quantize_run (GimpProcedure        *procedure,
                                           "width", width,
                                                 "width", width,
                                                 "relief", relief,
+                                      "threshold", threshold,
+                                          "threshold", threshold,
+                                                "threshold", threshold,
                                                 "strength", strength,
                                                 NULL);
       if (! filter)
@@ -505,6 +521,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "direction", direction,
                                       "width", width,
                                       "relief", relief,
+                                      "threshold", threshold,
                                           "color-top", color_top,
                                           "color-right", color_right,
                                           "color-bottom", color_bottom,
@@ -513,6 +530,8 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "width", width,
                                           "width", width,
                                           "relief", relief,
+                                      "threshold", threshold,
+                                          "threshold", threshold,
                                           "strength", strength,
                                           NULL);
         }
@@ -537,6 +556,7 @@ palette_quantize_run (GimpProcedure        *procedure,
                                       "direction", direction,
                                       "width", width,
                                       "relief", relief,
+                                      "threshold", threshold,
                                       "strength", strength,
                                       NULL);
     }
