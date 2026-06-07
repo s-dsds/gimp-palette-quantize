@@ -150,7 +150,7 @@ typedef struct
   guint       n;         /* number of palette colors                         */
   gfloat     *srgb;      /* n * 3, sRGB 0..1 — written to the output         */
   gfloat     *coord;     /* n * 3, palette colors in the metric space        */
-  const Babl *from_rgb;  /* fish: "R'G'B' float" -> metric space (3 ch)      */
+  const Babl *fish;      /* fish: "R'G'B' float" -> metric (linear/Lab only) */
   gfloat      amp;       /* ordered-dither amplitude (mean palette spacing)  */
   gfloat      bg[3];     /* background color (sRGB), for composite mode      */
   gfloat      dir_col[4][3]; /* directional colors sRGB: 0=top 1=right 2=bottom 3=left */
@@ -355,6 +355,53 @@ nearest_exact (const gfloat *p, const PaletteCache *c)
   return best;
 }
 
+/* sRGB -> linear for one channel. */
+static inline gfloat
+srgb_to_linear (gfloat c)
+{
+  return (c <= 0.04045f) ? c / 12.92f : powf ((c + 0.055f) / 1.055f, 2.4f);
+}
+
+/* Manual OKLab from sRGB (Björn Ottosson). babl's "Oklab float" is broken in
+ * this version (it returns garbage for saturated colors and nonzero a/b for
+ * neutrals), so we do it ourselves. */
+static void
+rgb_to_oklab (const gfloat *rgb, gfloat *o)
+{
+  gfloat r = srgb_to_linear (rgb[0]);
+  gfloat g = srgb_to_linear (rgb[1]);
+  gfloat b = srgb_to_linear (rgb[2]);
+
+  gfloat l = 0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b;
+  gfloat m = 0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * b;
+  gfloat s = 0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * b;
+
+  l = cbrtf (l); m = cbrtf (m); s = cbrtf (s);
+
+  o[0] = 0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s;
+  o[1] = 1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s;
+  o[2] = 0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s;
+}
+
+/* Convert an interleaved R'G'B' (sRGB, 3 ch) buffer into the metric space. */
+static void
+convert_to_metric (const PaletteCache *c, const gfloat *srgb, gfloat *out, glong n)
+{
+  switch (c->metric)
+    {
+    case GEGL_PQ_METRIC_OKLAB:
+      for (glong i = 0; i < n; i++)
+        rgb_to_oklab (srgb + i * 3, out + i * 3);
+      break;
+    case GEGL_PQ_METRIC_SRGB:
+      memcpy (out, srgb, (gsize) n * 3 * sizeof (gfloat));
+      break;
+    default:                          /* linear RGB, CIE Lab: babl is correct */
+      babl_process (c->fish, srgb, out, n);
+      break;
+    }
+}
+
 static PaletteCache *
 palette_cache_build (const gchar *palette_str, gint metric)
 {
@@ -368,7 +415,7 @@ palette_cache_build (const gchar *palette_str, gint metric)
   c->n        = n;
   c->srgb     = g_new (gfloat, (gsize) n * 3);
   c->coord    = g_new (gfloat, (gsize) n * 3);
-  c->from_rgb = babl_fish (babl_format ("R'G'B' float"), fmt);
+  c->fish     = babl_fish (babl_format ("R'G'B' float"), fmt);
   c->bg[0] = c->bg[1] = c->bg[2] = 1.0f;   /* default white; set in prepare */
 
   /* Directional defaults (overwritten in prepare): top white, sides gray,
@@ -389,7 +436,7 @@ palette_cache_build (const gchar *palette_str, gint metric)
     }
 
   /* Palette in the metric space (used for both matching and dithering). */
-  babl_process (c->from_rgb, c->srgb, c->coord, n);
+  convert_to_metric (c, c->srgb, c->coord, n);
 
   /* Ordered-dither amplitude: mean distance (in the metric space) from each
    * palette color to its nearest neighbor — a reasonable quantization step. */
@@ -562,7 +609,7 @@ process_ordered (const PaletteCache *c, gfloat *buf, glong w, glong h,
   gfloat *cm   = g_new (gfloat, (gsize) npix * 3);   /* src in metric space   */
 
   build_src (c, buf, src, w, h, ox, oy, amode, bcx, bcy);
-  babl_process (c->from_rgb, src, cm, npix);
+  convert_to_metric (c, src, cm, npix);
 
   for (glong y = 0; y < h; y++)
     for (glong x = 0; x < w; x++)
@@ -617,7 +664,7 @@ process_diffuse (const PaletteCache *c, gfloat *buf, glong w, glong h,
   diffusion_kernel (dither, &taps, &ntaps, &divisor);
 
   build_src (c, buf, src, w, h, ox, oy, amode, bcx, bcy);
-  babl_process (c->from_rgb, src, wm, npix);
+  convert_to_metric (c, src, wm, npix);
 
   for (glong y = 0; y < h; y++)
     {
