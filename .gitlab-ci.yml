@@ -1,0 +1,77 @@
+# CI for gimp-palette-quantize (GEGL op + GIMP 3 plug-in, C / meson).
+#
+# Linux builds both artifacts on Debian trixie (first Debian with GIMP 3 dev
+# packages) and smoke-tests that GEGL actually registers the operation.
+# Windows builds via MSYS2 (the repo's build-install-msys2.sh) and macOS via
+# Homebrew (GEGL op only - brew ships GIMP as an app bundle, no dev files).
+# Windows/macOS are manual + allow_failure: SaaS Windows runners are slow
+# (MSYS2 + GIMP toolchain is a multi-GB install) and macOS runners need a
+# Premium plan. On self-hosted GitLab, adjust `tags:`.
+
+stages:
+  - build
+
+build:linux:
+  stage: build
+  image: debian:trixie-slim
+  script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends
+        meson ninja-build gcc pkg-config
+        libglib2.0-dev libgegl-dev libgimp-3.0-dev gegl ca-certificates
+    - meson setup build
+    - meson compile -C build
+    - test -f build/src/gegl-palette-quantize.so
+    - test -f build/src/gimp-palette-quantize
+    # smoke test: GEGL loads the op and registers it
+    - GEGL_PATH=$PWD/build/src gegl --list-all | grep -q 'custom:palette-quantize'
+  artifacts:
+    name: gimp-palette-quantize-linux-$CI_COMMIT_SHORT_SHA
+    paths:
+      - build/src/gegl-palette-quantize.so
+      - build/src/gimp-palette-quantize
+    expire_in: 3 months
+
+build:windows:
+  stage: build
+  tags:
+    - saas-windows-medium-amd64
+  rules:
+    - when: manual
+      allow_failure: true
+  timeout: 2h
+  script:
+    - choco install -y msys2 --no-progress
+    # first pacman run updates the core; second installs our toolchain
+    - C:\tools\msys64\usr\bin\bash.exe -lc 'pacman -Syu --noconfirm'
+    - $env:MSYSTEM = 'UCRT64'
+    - $env:CHERE_INVOKING = '1'
+    - C:\tools\msys64\usr\bin\bash.exe -lc './build-install-msys2.sh deps'
+    - C:\tools\msys64\usr\bin\bash.exe -lc './build-install-msys2.sh build'
+  artifacts:
+    name: gimp-palette-quantize-windows-$CI_COMMIT_SHORT_SHA
+    paths:
+      - build/src/gegl-palette-quantize.dll
+      - build/src/gimp-palette-quantize.exe
+    expire_in: 3 months
+
+build:macos:
+  stage: build
+  tags:
+    - saas-macos-medium-m1
+  image: macos-14-xcode-15
+  rules:
+    - when: manual
+      allow_failure: true
+  script:
+    # brew has gegl/babl dev files but GIMP only as an app bundle, so this
+    # builds the GEGL operation only (meson warns and skips the plug-in)
+    - brew install meson ninja pkg-config gegl
+    - meson setup build
+    - meson compile -C build
+    - ls build/src/gegl-palette-quantize.*
+  artifacts:
+    name: gimp-palette-quantize-macos-$CI_COMMIT_SHORT_SHA
+    paths:
+      - build/src/gegl-palette-quantize.*
+    expire_in: 3 months
