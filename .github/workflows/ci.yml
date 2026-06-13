@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    # Debian trixie is the first Debian with GIMP 3 dev packages.
+    container: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain + GIMP/GEGL/babl dev files
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            meson ninja-build gcc pkg-config \
+            libglib2.0-dev libgegl-dev libgimp-3.0-dev gegl ca-certificates
+      - name: Build
+        run: |
+          meson setup build
+          meson compile -C build
+      - name: Smoke test (GEGL registers the op) + artifacts exist
+        run: |
+          test -f build/src/gegl-palette-quantize.so
+          test -f build/src/gimp-palette-quantize
+          GEGL_PATH="$PWD/build/src" gegl --list-all | grep -q 'custom:palette-quantize'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gimp-palette-quantize-linux
+          path: |
+            build/src/gegl-palette-quantize.so
+            build/src/gimp-palette-quantize
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-babl
+            mingw-w64-ucrt-x86_64-gegl
+            mingw-w64-ucrt-x86_64-gimp
+      - name: Build
+        run: |
+          meson setup build
+          meson compile -C build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gimp-palette-quantize-windows
+          path: |
+            build/src/gegl-palette-quantize.dll
+            build/src/gimp-palette-quantize.exe
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        # brew ships gegl/babl dev files but GIMP only as an app bundle, so this
+        # builds the GEGL operation only (meson warns and skips the plug-in).
+        run: brew install meson ninja pkg-config gegl babl
+      - name: Build (GEGL op only)
+        run: |
+          meson setup build
+          meson compile -C build
+          ls build/src/gegl-palette-quantize.*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gimp-palette-quantize-macos
+          path: build/src/gegl-palette-quantize.*
+          if-no-files-found: error

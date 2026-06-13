@@ -1,0 +1,96 @@
+name: Release
+
+# Push a tag like v0.11.0 to build per-OS binaries and cut a release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: debian:trixie-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            meson ninja-build gcc pkg-config \
+            libglib2.0-dev libgegl-dev libgimp-3.0-dev gegl ca-certificates zip
+      - name: Build + smoke test
+        run: |
+          meson setup build
+          meson compile -C build
+          GEGL_PATH="$PWD/build/src" gegl --list-all | grep -q 'custom:palette-quantize'
+      - name: Zip
+        run: |
+          mkdir -p out
+          zip -j "out/gimp-palette-quantize-${GITHUB_REF_NAME}-linux.zip" \
+            build/src/gegl-palette-quantize.so build/src/gimp-palette-quantize
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: out/*.zip, if-no-files-found: error }
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-babl
+            mingw-w64-ucrt-x86_64-gegl
+            mingw-w64-ucrt-x86_64-gimp
+            zip
+      - name: Build
+        run: |
+          meson setup build
+          meson compile -C build
+      - name: Zip
+        run: |
+          mkdir -p out
+          zip -j "out/gimp-palette-quantize-${GITHUB_REF_NAME}-windows.zip" \
+            build/src/gegl-palette-quantize.dll build/src/gimp-palette-quantize.exe
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: out/*.zip, if-no-files-found: error }
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps (GEGL op only; brew has no GIMP dev files)
+        run: brew install meson ninja pkg-config gegl babl
+      - name: Build
+        run: |
+          meson setup build
+          meson compile -C build
+      - name: Zip
+        run: |
+          mkdir -p out
+          zip -j "out/gimp-palette-quantize-${GITHUB_REF_NAME}-macos.zip" build/src/gegl-palette-quantize.*
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: out/*.zip, if-no-files-found: error }
+
+  release:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
