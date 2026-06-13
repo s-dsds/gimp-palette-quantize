@@ -84,3 +84,47 @@ jobs:
           name: gimp-palette-quantize-macos
           path: build/src/gegl-palette-quantize.*
           if-no-files-found: error
+
+  flatpak:
+    # Builds against GIMP's *Flatpak* runtime (org.gnome.Sdk + GIMP's bundled
+    # GEGL/babl), so the .so actually loads inside a Flatpak GIMP - which the
+    # host/debian build is not guaranteed to. Mirrors build-install-flatpak.sh.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install flatpak + GIMP runtime & matching GNOME SDK
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq flatpak
+          # ubuntu 24.04 blocks the unprivileged user namespaces bubblewrap needs
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          flatpak remote-add --if-not-exists --user flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --user --noninteractive flathub org.gimp.GIMP
+          branch=$(flatpak info org.gimp.GIMP \
+            | sed -n 's@.*Sdk:[[:space:]]*org\.gnome\.Sdk/[^/]*/\([0-9]\+\).*@\1@p' | head -1)
+          echo "Matching GNOME SDK branch: $branch"
+          flatpak install -y --user --noninteractive flathub "org.gnome.Sdk//$branch"
+      - name: Build inside the GIMP Flatpak SDK
+        run: |
+          flatpak run --devel --filesystem=host --share=network --command=bash org.gimp.GIMP -c \
+            "export PKG_CONFIG_PATH=/app/lib/pkgconfig:/app/lib/x86_64-linux-gnu/pkgconfig; cd '$PWD' && meson setup build && meson compile -C build"
+          test -f build/src/gegl-palette-quantize.so
+      - name: Check the op registers in Flatpak GIMP (best-effort)
+        run: |
+          dst="$HOME/.var/app/org.gimp.GIMP/data/gegl-0.4/plug-ins"
+          mkdir -p "$dst"; cp build/src/gegl-palette-quantize.so "$dst/"
+          if flatpak run --command=sh org.gimp.GIMP -c 'gegl --list-all 2>/dev/null' \
+               | grep -q 'custom:palette-quantize'; then
+            echo "OK: custom:palette-quantize registered in Flatpak GIMP"
+          else
+            echo "WARN: op not listed by gegl (build still produced the .so)"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gimp-palette-quantize-flatpak
+          path: |
+            build/src/gegl-palette-quantize.so
+            build/src/gimp-palette-quantize
+          if-no-files-found: error
