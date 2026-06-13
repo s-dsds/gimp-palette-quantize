@@ -20,11 +20,18 @@ Two pieces, joined by an inline `#rrggbb;...` palette string:
 - **Dithering**: `none`, `ordered` (Bayer 8x8), `blue-noise` (interleaved
   gradient noise), `floyd-steinberg`, `atkinson`, `jarvis`, `stucki`, `sierra`,
   plus a **serpentine** toggle for the error-diffusion kernels.
-- **Alpha**: `preserve`, `opaque`, `composite` (over a Background color),
-  `directional-pos` (4-color position gradient backdrop), `directional-edge`
-  (pseudo-emboss: tints edges by orientation). Directional modes use four colors
-  (`color-top/right/bottom/left`) + `direction` (deg) + `relief` (emboss depth).
+- **Alpha**: `opaque` (default — ignore alpha, output opaque), `preserve`,
+  `composite` (over a Background color), `dir-paint` / `dir-tint` (recolor each
+  stroke by its alpha-height-field surface normal), `bevel` (3D bevel/emboss).
+  Directional modes use four colors (`color-top/right/bottom/left`) +
+  `direction` (deg) + `width` (px) + `relief` (depth); bevel uses Top=highlight,
+  Bottom=shadow. A per-stroke bounding-box gradient mode (`dir-bbox`) existed in
+  ≤0.8.x and was removed in 0.9.0.
 - **Strength**: blend original ↔ quantized.
+
+The interactive dialog hides mode-irrelevant controls: `show_dialog()` connects
+to `notify::alpha`/`notify::dither` on the config and toggles widget visibility
+(`gimp_procedure_dialog_get_widget` + `gtk_widget_set_no_show_all`/`set_visible`).
 
 Matching is **exact** (O(n) scan in the metric space, ties → lowest index),
 tuned for palettes ≤ 256 colors. Output is always an exact palette color, so a
@@ -39,6 +46,12 @@ later `Image > Mode > Indexed` with the same palette gives stable indices.
 - `build_src()` produces the per-pixel match/blend **source** color for *every*
   alpha mode, so dithering composes with all alpha modes uniformly. The rest
   (match → dither → write, set output alpha) is mode-agnostic.
+- `build_src_normal()` (dir-paint/dir-tint/bevel): the alpha is box-blurred
+  **3×** (≈Gaussian) into a height field, and a **Sobel** 3×3 gradient gives the
+  surface normal. Both matter for the bevel: a 2-pass box blur + 2-tap central
+  difference left axis-aligned facets/"vertical cuts"; 3-pass + Sobel make the
+  bevel a smooth ramp. Bevel shade gain ≈ `1.5 * (width+1)` so it ramps across
+  the band instead of saturating at the edge.
 - `convert_to_metric()` is the metric conversion: sRGB = identity, OKLab =
   **manual** (see gotcha), linear/CIE-Lab = babl fish.
 - Whole-image processing is forced (`needs_whole_image`) for the error-diffusion

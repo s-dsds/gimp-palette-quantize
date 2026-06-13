@@ -71,7 +71,6 @@ enum_start (gegl_palette_quantize_alpha)
   enum_value (GEGL_PQ_ALPHA_COMPOSITE, "composite", "Composite over background")
   enum_value (GEGL_PQ_ALPHA_DIR_PAINT, "dir-paint", "Directional paint (by shape)")
   enum_value (GEGL_PQ_ALPHA_DIR_TINT,  "dir-tint",  "Directional tint (by shape)")
-  enum_value (GEGL_PQ_ALPHA_DIR_BBOX,  "dir-bbox",  "Directional gradient (per stroke)")
   enum_value (GEGL_PQ_ALPHA_BEVEL,     "bevel",     "Bevel / emboss")
 enum_end (GeglPaletteQuantizeAlpha)
 
@@ -93,7 +92,7 @@ property_boolean (serpentine, "Serpentine", FALSE)
 
 property_enum (alpha, "Alpha",
                GeglPaletteQuantizeAlpha, gegl_palette_quantize_alpha,
-               GEGL_PQ_ALPHA_COMPOSITE)
+               GEGL_PQ_ALPHA_OPAQUE)
   description ("How to treat alpha so the visible color is an exact palette color")
 
 property_color (background, "Background", "white")
@@ -532,22 +531,6 @@ blur_alpha (const gfloat *buf, glong w, glong h, gint r, gint iters, gfloat *hgt
   g_free (tmp);
 }
 
-/* Union-find for per-stroke connected components (4-connectivity). */
-static gint
-uf_find (gint *par, gint i)
-{
-  while (par[i] != i) { par[i] = par[par[i]]; i = par[i]; }
-  return i;
-}
-
-static void
-uf_union (gint *par, gint a, gint b)
-{
-  a = uf_find (par, a);
-  b = uf_find (par, b);
-  if (a != b) par[a] = b;
-}
-
 /* Blend the four directional colors by a (screen-space) unit vector, rotated
  * by the lighting direction. Screen y points down; top = -y. */
 static void
@@ -583,22 +566,35 @@ build_src_normal (const PaletteCache *c, const gfloat *buf, gfloat *src,
 {
   gint    r     = (gint) (c->width + 0.5f);
   gfloat *hgt   = g_new (gfloat, (gsize) w * h);
-  gfloat  bgain = 4.0f * (c->width + 1.0f);   /* bevel slope -> shade scale */
+  /* With a smooth (Gaussian-ish) height field the edge slope is ~1/width, so
+   * scale by ~width to make the bevel shade ramp across the whole band rather
+   * than saturating in the first pixel (which read as hard "cuts"). */
+  gfloat  bgain = 1.5f * (c->width + 1.0f);
   gfloat  Lx    = cosf (c->dir);
   gfloat  Ly    = -sinf (c->dir);
 
-  blur_alpha (buf, w, h, r, 2, hgt);
+  /* Three box-blur passes approximate a Gaussian; this removes the faceting /
+   * axis-aligned steps that a 2-pass box blur leaves in the height field. */
+  blur_alpha (buf, w, h, r, 3, hgt);
 
   for (glong y = 0; y < h; y++)
     for (glong x = 0; x < w; x++)
       {
-        gsize         p  = (gsize) y * w + x;
-        const gfloat *px = buf + p * 4;
-        gfloat       *d  = src + p * 3;
-        gfloat gx = (hgt[(gsize) y * w + CLAMP (x + 1, 0, w - 1)] -
-                     hgt[(gsize) y * w + CLAMP (x - 1, 0, w - 1)]) * 0.5f;
-        gfloat gy = (hgt[(gsize) CLAMP (y + 1, 0, h - 1) * w + x] -
-                     hgt[(gsize) CLAMP (y - 1, 0, h - 1) * w + x]) * 0.5f;
+        gsize         p   = (gsize) y * w + x;
+        const gfloat *px  = buf + p * 4;
+        gfloat       *d   = src + p * 3;
+        glong         xm  = CLAMP (x - 1, 0, w - 1);
+        glong         xp  = CLAMP (x + 1, 0, w - 1);
+        glong         ym  = CLAMP (y - 1, 0, h - 1) * w;
+        glong         yp  = CLAMP (y + 1, 0, h - 1) * w;
+        glong         yc  = y * w;
+        /* Sobel gradient (3x3): includes the diagonal neighbours, so the normal
+         * varies smoothly instead of the axis-aligned banding that a 2-tap
+         * central difference produces on a blurred edge. */
+        gfloat gx = (hgt[ym + xp] + 2.0f * hgt[yc + xp] + hgt[yp + xp] -
+                     hgt[ym + xm] - 2.0f * hgt[yc + xm] - hgt[yp + xm]) * 0.125f;
+        gfloat gy = (hgt[yp + xm] + 2.0f * hgt[yp + x]  + hgt[yp + xp] -
+                     hgt[ym + xm] - 2.0f * hgt[ym + x]  - hgt[ym + xp]) * 0.125f;
         gfloat nx = -gx, ny = -gy;            /* outward normal = -gradient */
         gfloat mag = sqrtf (nx * nx + ny * ny);
 
@@ -639,65 +635,6 @@ build_src_normal (const PaletteCache *c, const gfloat *buf, gfloat *src,
   g_free (hgt);
 }
 
-/* Per-stroke directional gradient: label connected alpha regions, then color
- * each pixel by its position within its own stroke's bounding box. */
-static void
-build_src_bbox (const PaletteCache *c, const gfloat *buf, gfloat *src,
-                glong w, glong h)
-{
-  gsize  n   = (gsize) w * h;
-  gint  *par = g_new (gint, n);
-  gint  *bx0 = g_new (gint, n), *bx1 = g_new (gint, n);
-  gint  *by0 = g_new (gint, n), *by1 = g_new (gint, n);
-
-#define INSTK(i) (buf[(i) * 4 + 3] > 0.5f)
-  for (gsize i = 0; i < n; i++) par[i] = (gint) i;
-
-  for (glong y = 0; y < h; y++)
-    for (glong x = 0; x < w; x++)
-      {
-        gsize i = (gsize) y * w + x;
-        if (! INSTK (i)) continue;
-        if (x > 0 && INSTK (i - 1)) uf_union (par, (gint) i, (gint) (i - 1));
-        if (y > 0 && INSTK (i - w)) uf_union (par, (gint) i, (gint) (i - w));
-      }
-
-  for (gsize i = 0; i < n; i++) { bx0[i] = w; bx1[i] = -1; by0[i] = h; by1[i] = -1; }
-
-  for (glong y = 0; y < h; y++)
-    for (glong x = 0; x < w; x++)
-      {
-        gsize i = (gsize) y * w + x;
-        if (! INSTK (i)) continue;
-        gint rt = uf_find (par, (gint) i);
-        if (x < bx0[rt]) bx0[rt] = x; if (x > bx1[rt]) bx1[rt] = x;
-        if (y < by0[rt]) by0[rt] = y; if (y > by1[rt]) by1[rt] = y;
-      }
-
-  for (glong y = 0; y < h; y++)
-    for (glong x = 0; x < w; x++)
-      {
-        gsize         i  = (gsize) y * w + x;
-        const gfloat *px = buf + i * 4;
-        gfloat       *d  = src + i * 3;
-        gint          rt;
-        gfloat        cx, cy, hw, hh, vx, vy, len, col[3];
-
-        if (! INSTK (i)) { d[0] = px[0]; d[1] = px[1]; d[2] = px[2]; continue; }
-        rt = uf_find (par, (gint) i);
-        cx = (bx0[rt] + bx1[rt]) * 0.5f; cy = (by0[rt] + by1[rt]) * 0.5f;
-        hw = (bx1[rt] - bx0[rt]) * 0.5f + 1e-3f;
-        hh = (by1[rt] - by0[rt]) * 0.5f + 1e-3f;
-        vx = (x - cx) / hw; vy = (y - cy) / hh;
-        len = sqrtf (vx * vx + vy * vy);
-        if (len > 1e-6f) { vx /= len; vy /= len; }
-        blend_dir (c, vx, vy, col);
-        d[0] = col[0]; d[1] = col[1]; d[2] = col[2];
-      }
-#undef INSTK
-  g_free (par); g_free (bx0); g_free (bx1); g_free (by0); g_free (by1);
-}
-
 /* Build the straight-RGB color that will be matched and used as the blend
  * source, per alpha mode. */
 static void
@@ -712,11 +649,6 @@ build_src (const PaletteCache *c, const gfloat *buf, gfloat *src,
       amode == GEGL_PQ_ALPHA_BEVEL)
     {
       build_src_normal (c, buf, src, w, h, amode);
-      return;
-    }
-  if (amode == GEGL_PQ_ALPHA_DIR_BBOX)
-    {
-      build_src_bbox (c, buf, src, w, h);
       return;
     }
 
@@ -906,7 +838,7 @@ process (GeglOperation       *operation,
 
   (void) level;
 
-  if (! c || roi->width <= 0 || roi->height <= 0)
+  if (! c || ! roi || roi->width <= 0 || roi->height <= 0)
     return TRUE;
 
   strength = CLAMP ((gfloat) o->strength, 0.0f, 1.0f);
@@ -965,6 +897,8 @@ get_required_for_output (GeglOperation       *operation,
       if (in)
         return *in;
     }
+  if (! roi)                       /* defensive: never deref a NULL roi */
+    return *GEGL_RECTANGLE (0, 0, 0, 0);
   return *roi;
 }
 
@@ -980,6 +914,8 @@ get_cached_region (GeglOperation       *operation,
       if (in)
         return *in;
     }
+  if (! roi)                       /* defensive: never deref a NULL roi */
+    return *GEGL_RECTANGLE (0, 0, 0, 0);
   return *roi;
 }
 

@@ -1,5 +1,5 @@
 project('gimp-palette-quantize', 'c',
-  version: '0.8.2',
+  version: '0.11.0',
   default_options: ['warning_level=2', 'c_std=c11']
 )
 

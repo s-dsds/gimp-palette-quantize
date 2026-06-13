@@ -45,13 +45,12 @@ the row direction to remove the diagonal "worm" artifacts.
 The **Alpha** dropdown controls how transparency is handled so the *visible*
 pixel can be an exact palette color:
 
+- `Opaque (ignore alpha)` (default) — quantize the pixel's own color and output
+  it fully opaque, ignoring its alpha and whatever is below.
 - `Preserve alpha` — quantize the color, keep each pixel's original alpha.
-- `Opaque (ignore alpha)` — quantize the pixel's own color and output it fully
-  opaque, ignoring its alpha and whatever is below.
-- `Composite over background` (default) — blend each pixel over the
-  **Background** color using its alpha, then quantize, and output opaque. This
-  makes the visible result an exact palette color even for semi-transparent
-  pixels.
+- `Composite over background` — blend each pixel over the **Background** color
+  using its alpha, then quantize, and output opaque. This makes the visible
+  result an exact palette color even for semi-transparent pixels.
 The **directional** modes color or shade each *stroke* by its own shape: they
 treat the layer's alpha (blurred by **Width**) as a height field and use its
 surface normal, with four colors (**Top/Right/Bottom/Left**) and a
@@ -62,12 +61,14 @@ surface normal, with four colors (**Top/Right/Bottom/Left**) and a
   sides Left/Right. Replaces the stroke color.
 - `Directional tint (by shape)` — same, but blended over the original color
   (**Relief** = amount), so the underlying texture shows through.
-- `Directional gradient (per stroke)` — color each *separate* stroke by its
-  position within its own bounding box (connected strokes are detected; merged
-  /overlapping strokes count as one).
 - `Bevel / emboss` — a real 3D bevel: a **Width**-wide band ramping in from the
   edge, highlighting the side facing the light (Top color) and shadowing the
   opposite side (Bottom color); **Relief** = strength, **Direction** = light.
+
+In the interactive dialog the mode-specific controls (Background, the four
+directional colors, Direction/Width/Relief, Serpentine) are only shown when the
+selected Alpha/Dithering mode actually uses them. Bevel shows just the Top
+(highlight) and Bottom (shadow) colors.
 
 Every mode except Preserve outputs fully opaque, exact palette colors. The
 **Alpha threshold** (default 0.5) gives hard edges: pixels with coverage below
